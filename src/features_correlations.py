@@ -55,23 +55,27 @@ def calculate_radius(center_ref,center_comp,segments):
             poi = None
     return poi
 
-def calculate_radii(params, param_cis):
-    radii = {}
+def calculate_radii(params):
+    radii_values = []
     for i, param in enumerate(params):
         center_ref, center_comp, segments = param
-        radius = calculate_radius(center_ref,center_comp,segments)
-        if radius is None:
+        if np.array_equal(center_ref, center_comp):
+            radii_values.append(0)
             continue
-        radii[param_cis[i]] = LineString([center_ref,radius])
-    return radii
+        radius = calculate_radius(center_ref, center_comp, segments)
+        if radius is not None:
+            radii_values.append(LineString([center_ref, radius]).length)
+        else:
+            radii_values.append(0)
+    
+    return np.array(radii_values)
 
-def calculate_overlap(rad1,rad2,connection):
-    dist = connection.length
-    rad_length1 = rad1.length
-    rad_length2 = rad2.length
+def calculate_overlap(rad1,rad2,dist):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        overlap = dist/np.mean([rad_length1, rad_length2])
+        if rad1 == 0 or rad2 == 0:
+            return 0
+        overlap = dist/np.mean([rad1, rad2])
     return overlap
 
 def calculate_area_overlap(rfbool1,rfbool2):
@@ -90,34 +94,34 @@ def calculate_inner_product(sig_sta1,sig_sta2):
                                     [np.diag_indices_from(sig_sta2.T @ sig_sta2)])))
     return inner_product
     
-def calculate_overlaps(params, ci2s):
-    overlaps = {}
-    for i, ci2 in enumerate(ci2s):
+def calculate_overlaps(params, num_ci2s):
+    overlap_values = []
+    for i in range(num_ci2s):
         ci_params = params[i]
-        overlaps[ci2] = calculate_overlap(ci_params[0],ci_params[1],ci_params[2])
+        overlap_values.append(calculate_overlap(ci_params[0], ci_params[1], ci_params[2]))
         
-    return overlaps
+    return np.array(overlap_values)
 
-def calculate_area_overlaps(params, ci2s):
-    area_overlaps = {}
-    for i, ci2 in enumerate(ci2s):
+def calculate_area_overlaps(params, num_ci2s):
+    area_overlap_values = []
+    for i in range(num_ci2s):
         ci_params = params[i]
-        area_overlaps[ci2] = calculate_area_overlap(ci_params[0],ci_params[1])
+        area_overlap_values.append(calculate_area_overlap(ci_params[0], ci_params[1]))
         
-    return area_overlaps
+    return np.array(area_overlap_values)
 
-def calculate_inner_products(params, ci2s):
-    inner_products = {}
-    for i, ci2 in enumerate(ci2s):
+def calculate_inner_products(params, num_ci2s):
+    inner_product_values = []
+    for i in range(num_ci2s):
         ci_params = params[i]
-        inner_products[ci2] = calculate_inner_product(ci_params[0],ci_params[1])
+        inner_product_values.append(calculate_inner_product(ci_params[0], ci_params[1]))
         
-    return inner_products
+    return np.array(inner_product_values)
 
-def calculate_all_overlaps(overlap_params, area_params, inner_product_params, ci2s):
-    overlaps = calculate_overlaps(overlap_params, ci2s)
-    area_overlaps = calculate_area_overlaps(area_params, ci2s)
-    inner_products = calculate_inner_products(inner_product_params, ci2s)
+def calculate_all_overlaps(overlap_params, area_params, inner_product_params, num_ci2s):
+    overlaps = calculate_overlaps(overlap_params, num_ci2s)
+    area_overlaps = calculate_area_overlaps(area_params, num_ci2s)
+    inner_products = calculate_inner_products(inner_product_params, num_ci2s)
     
     return overlaps, area_overlaps, inner_products
 
@@ -163,70 +167,57 @@ def generate_fast_cchs(spikes,delay,spike_bin_sizes,t_stop,num_units):
 
 class Feature_rf_radii(Feature):
     name = 'rf radii'
-    requires = {'unit':{'rf_convex_hull', 'hull_center_x', 'hull_center_y'}}
-    provides = {'unit':{'rf_radii','rf_connections'}}
-    
+    requires = {'unit': {'rf_convex_hull', 'hull_center_x', 'hull_center_y'}}
+    provides = {'unit': {'rf_radii'}}
+
     def generate(self, ct, unit_indices, inpt, dtab=None):
         if dtab is None:
             dtab = ct.unit_table
         di = unit_indices[0][0:2]
         if (missing := self.check_requirements(ct, di)) is not None:
-            print('Feature {}. missing requirements {}'.format(self.name, missing))
+            print(f'Feature {self.name}. missing requirements {missing}')
             return
-        
+
         print("Generating Params")
         mp_params = []
         bad_units = []
         for ci in tqdm(unit_indices):
-            connections = {}
             center_x = dtab.at[ci, 'hull_center_x']
             center_y = dtab.at[ci, 'hull_center_y']
             center_ref = np.array([center_x, center_y])
             segments = dtab.at[ci, 'rf_convex_hull'].a[0]
-            params = []
-            params_cis = []
-            for ci2 in unit_indices:
-                if ci == ci2:
-                    continue
-                center_x2 = dtab.at[ci2, 'hull_center_x']
-                center_y2 = dtab.at[ci2, 'hull_center_y']
-                center_comp = np.array([center_x2, center_y2])
-                
-                params.append((center_ref,center_comp,segments))
-                params_cis.append(ci2)
-                connections[ci2] = LineString([center_ref, center_comp])
-            mp_params.append((params, params_cis))
-            if connections is None or len(connections) == 0:
+
+            # Collect parameters for each unit
+            params = [(center_ref, np.array([dtab.at[ci2, 'hull_center_x'], dtab.at[ci2, 'hull_center_y']]), segments)
+                      for ci2 in unit_indices]
+            
+            if not params:
                 bad_units.append(ci)
-                dtab.at[ci, 'rf_connections'] = wrapper(None)
-            else:
-                dtab.at[ci, 'rf_connections'] = wrapper(connections)
+
+            mp_params.append(params)
         
         print("Calculating Radii")
-            
+
         with mp.Pool(MP_N_THREADS) as pool:
-            radii = list(tqdm(pool.istarmap(calculate_radii, mp_params), total=len(mp_params)))
-            
-            pool.close()
-            pool.join()
-        
-        for i, ci in enumerate(unit_indices):
-            if radii[i] is None or len(radii[i]) == 0:
-                bad_units.append(ci)
-                dtab.at[ci, 'rf_radii'] = wrapper(None)
-            else:
-                dtab.at[ci, 'rf_radii'] = wrapper(radii[i])
-            
-        if len(bad_units) > 0:
+            radii_results = list(tqdm(pool.imap(calculate_radii, mp_params), total=len(mp_params)))
+
+        # Process results
+        radii_results = np.around(np.array(radii_results), decimals=4)
+        ct.dataset_table.at[di, 'rf_radii'] = wrapper(radii_results)
+        ct.dataset_table.at[di, 'radii_ids'] = wrapper(unit_indices)
+
+        if bad_units:
             print(f'Found {len(bad_units)} bad units, No radii found, Setting units as invalid')
             dtab.loc[bad_units, 'valid'] = False
+
         self.update_valid_columns(ct, di)
+
         
 class Feature_rf_overlaps(Feature):
     name = 'rf overlaps'
-    requires = {'unit':{'rf_radii', 'rf_connections', 'map_sig_stixels',
-                        'map_sta_peak'}}
-    provides = {'unit':{'rf_overlaps', 'rf_area_overlaps', 'rf_inner_products'}}
+    requires = {'unit':{ 'map_sig_stixels', 'map_sta_peak'},
+                'dataset':{'rf_radii', 'radii_ids'}}
+    provides = {'dataset':{'rf_overlaps', 'rf_area_overlaps', 'rf_inner_products', 'overlap_ids'}}
     
     def generate(self, ct, unit_indices, inpt, dtab=None):
         if dtab is None:
@@ -244,13 +235,13 @@ class Feature_rf_overlaps(Feature):
             ctype_units = dtab.query('label_manual_text == @ctype and sta_extremes == sta_extremes and valid == True')
             primary_channels[ctype] = cdl.channelize(ct.find_primary_channel(ctype_units))
         
+        all_radii = ct.dataset_table.at[di, 'rf_radii'].a
         for i, ci in tqdm(enumerate(unit_indices), total=len(unit_indices)):
             ci_overlap_params = []
             ci_inner_product_params = []
             ci_area_overlap_params = []
-            ci2s = []
-            radii = dtab.at[ci, 'rf_radii'].a
-            ci_connections = dtab.at[ci, 'rf_connections'].a
+            radii = all_radii[i,:]
+            ci_center = np.array([dtab.at[ci, 'hull_center_x'], dtab.at[ci, 'hull_center_y']])
             sig_stixels1 = dtab.at[ci, 'map_sig_stixels'].a
             sta_peak1 = dtab.at[ci, 'map_sta_peak'].a
             
@@ -258,17 +249,12 @@ class Feature_rf_overlaps(Feature):
             rf_bool1 = np.fliplr(dtab.at[ci, 'map_rf_bool'].a[:,:,primary_channels[ci_type]]).T
             
             for j, ci2 in enumerate(unit_indices):
-                if i >= j:
-                    continue
-                if ci2 not in radii:
-                    continue
-                radii2 = dtab.at[ci2, 'rf_radii'].a
-                if ci not in radii2:
-                    continue
-                connection = ci_connections[ci2]
-                radius = radii[ci2]
-                radius2 = radii2[ci]
-                ci_overlap_params.append((radius, radius2, connection))
+                radii2 = all_radii[j,:]
+                ci2_center = np.array([dtab.at[ci2, 'hull_center_x'], dtab.at[ci2, 'hull_center_y']])
+                dist = np.linalg.norm(ci_center - ci2_center)
+                radius = radii[j]
+                radius2 = radii2[i]
+                ci_overlap_params.append((radius, radius2, dist))
                 
                 sig_stixels2 = dtab.at[ci2, 'map_sig_stixels'].a
                 sig_stixels_u = np.logical_or(sig_stixels1, sig_stixels2)
@@ -280,179 +266,34 @@ class Feature_rf_overlaps(Feature):
                 rf_bool2 = np.fliplr(dtab.at[ci2, 'map_rf_bool'].a[:,:,primary_channels[ci2_type]]).T
                 ci_area_overlap_params.append((rf_bool1, rf_bool2))
                 
-                ci2s.append(ci2)
-                
             all_overlap_params.append((ci_overlap_params, ci_area_overlap_params, 
-                                       ci_inner_product_params, ci2s))
+                                       ci_inner_product_params, len(unit_indices)))
                 
         print("Calculating Overlaps, Area Overlaps, and Inner Products")
         with mp.Pool(MP_N_THREADS) as pool:
-            half_overlaps = list(tqdm(pool.istarmap(calculate_all_overlaps, all_overlap_params),
+            overlaps = list(tqdm(pool.istarmap(calculate_all_overlaps, all_overlap_params),
                                       total=len(all_overlap_params)))
             pool.close()
             pool.join()
         
-        all_overlaps = np.zeros((len(unit_indices), len(unit_indices)))
-        all_area_overlaps = np.zeros((len(unit_indices), len(unit_indices)))
-        all_inner_products = np.zeros((len(unit_indices), len(unit_indices)))
-        for i, ci in enumerate(unit_indices):
-            for j, ci2 in enumerate(unit_indices):
-                if ci2 not in half_overlaps[i][0]:
-                    continue
-                all_overlaps[i,j] = half_overlaps[i][0][ci2]
-                all_overlaps[j,i] = half_overlaps[i][0][ci2]
-                all_area_overlaps[i,j] = half_overlaps[i][1][ci2]
-                all_area_overlaps[j,i] = half_overlaps[i][1][ci2]
-                all_inner_products[i,j] = half_overlaps[i][2][ci2]
-                all_inner_products[j,i] = half_overlaps[i][2][ci2]
-
-            overlaps = {ci2: all_overlaps[i,j] for j, ci2 in enumerate(unit_indices)}
-            area_overlaps = {ci2: all_area_overlaps[i,j] for j, ci2 in enumerate(unit_indices)}
-            inner_products = {ci2: all_inner_products[i,j] for j, ci2 in enumerate(unit_indices)}
-                
-            dtab.at[ci, 'rf_overlaps'] = wrapper(overlaps)
-            dtab.at[ci, 'rf_area_overlaps'] = wrapper(area_overlaps)
-            dtab.at[ci, 'rf_inner_products'] = wrapper(inner_products)
+        all_overlaps = np.array([overlaps[i][0] for i in range(len(overlaps))])
+        all_area_overlaps = np.array([overlaps[i][1] for i in range(len(overlaps))])
+        all_inner_products = np.array([overlaps[i][2] for i in range(len(overlaps))])
+        all_overlaps = np.around(all_overlaps, decimals=4)
+        all_area_overlaps = np.around(all_area_overlaps, decimals=4)
+        all_inner_products = np.around(all_inner_products, decimals=4)
+            
+        ct.dataset_table.at[di, 'rf_overlaps'] = wrapper(all_overlaps)
+        ct.dataset_table.at[di, 'rf_area_overlaps'] = wrapper(all_area_overlaps)
+        ct.dataset_table.at[di, 'rf_inner_products'] = wrapper(all_inner_products)
+        ct.dataset_table.at[di, 'overlap_ids'] = wrapper(unit_indices)
         
         self.update_valid_columns(ct, di)
-        
-class Feature_cross_correlations_complete(Feature):
-    name = 'calculate cross correlations'
-    requires = {'unit':{'spike_times'}}
-    provides = {'unit':{'1ms CCHs', '10ms CCHs','CCs'}}
-    
-    def generate(self, ct, unit_indices, inpt, dtab=None):
-        if dtab is None:
-            dtab = ct.unit_table
-        di = unit_indices[0][0:2]
-        if (missing := self.check_requirements(ct, di)) is not None:
-            print('Feature {}. missing requirements {}'.format(self.name, missing))
-            return
-        
-        num_units = len(unit_indices)
-        spikes = [s.a / 20000 * pq.s for s in dtab.loc[unit_indices, 'spike_times']]
-        t_stop = np.ceil(np.max([np.max(spikes[cc]) for cc in range(num_units)])) + 1
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            spike_trains = [SpikeTrain(spikes[cc], t_stop=t_stop) for cc in range(num_units)]
-            binned_spike_trains_1ms = BinnedSpikeTrain([spike_trains[cc] for cc in range(num_units)],
-                                                       bin_size=0.001 * pq.s)
-            binned_spike_trains_10ms = BinnedSpikeTrain([spike_trains[cc] for cc in range(num_units)],
-                                                        bin_size=0.01 * pq.s)
-        
-        all_cchs_1ms = np.zeros((num_units, num_units, WINDOW_SIZE))
-        all_cchs_10ms = np.zeros((num_units, num_units, WINDOW_SIZE))
-        all_ccs = np.zeros((num_units, num_units))
-        
-        with mp.Pool(MP_N_THREADS) as pool:
-            half_cchs_1ms = list(tqdm(pool.istarmap(calculate_cchs, 
-                                        [(ci_index,[*range(ci_index+1,num_units)],
-                                          binned_spike_trains_1ms)
-                                         for ci_index in range(num_units)]), 
-                                  total=num_units))
-            pool.close()
-            pool.join()
-
-        with mp.Pool(MP_N_THREADS) as pool:
-            half_cchs_10ms = list(tqdm(pool.istarmap(calculate_cchs, 
-                                        [(ci_index,[*range(ci_index+1,num_units)],
-                                          binned_spike_trains_10ms)
-                                         for ci_index in range(num_units)]), 
-                                  total=num_units))
-            pool.close()
-            pool.join()
-        
-        for i, ci in enumerate(unit_indices):
-            all_cchs_1ms[i, i+1:, :] = half_cchs_1ms[i]
-            all_cchs_1ms[i+1:, i, :] = np.flip(half_cchs_1ms[i])
-            all_cchs_10ms[i, i+1:, :] = half_cchs_10ms[i]
-            all_cchs_10ms[i+1:, i, :] = np.flip(half_cchs_10ms[i])
-            all_ccs[i, i+1:] = half_cchs_10ms[i][(WINDOW_SIZE-1)//2]
-            all_ccs[i+1:, i] = half_cchs_10ms[i][(WINDOW_SIZE-1)//2]
-            
-            cchs_1ms = {ci2: all_cchs_1ms[i,j,:] for j, ci2 in enumerate(unit_indices)}
-            cchs_10ms = {ci2: all_cchs_10ms[i,j,:] for j, ci2 in enumerate(unit_indices)}
-            ccs = {ci2: all_ccs[i,j] for j, ci2 in enumerate(unit_indices)}
-            
-            dtab.at[ci, '1ms CCHs'] = wrapper(cchs_1ms)
-            dtab.at[ci, '10ms CCHs'] = wrapper(cchs_10ms)
-            dtab.at[ci, 'CCs'] = wrapper(ccs)
-        
-        self.update_valid_columns(ct, di)
-        
-class Feature_overlapping_cross_correlations(Feature):
-    name = 'calculate overlapping cross correlations'
-    requires = {'unit':{'spike_times','rf_overlaps'}}
-    provides = {'unit':{'1ms CCHs', '10ms CCHs','CCs'}}
-    
-    def generate(self, ct, unit_indices, inpt, dtab=None):
-        if dtab is None:
-            dtab = ct.unit_table
-        di = unit_indices[0][0:2]
-        if (missing := self.check_requirements(ct, di)) is not None:
-            print('Feature {}. missing requirements {}'.format(self.name, missing))
-            return
-        
-        num_units = len(unit_indices)
-        spikes = [s.a / 20000 * pq.s for s in dtab.loc[unit_indices, 'spike_times']]
-        t_stop = np.ceil(np.max([np.max(spikes[cc]) for cc in range(num_units)])) + 1
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            spike_trains = [SpikeTrain(spikes[cc], t_stop=t_stop) for cc in range(num_units)]
-            binned_spike_trains_1ms = BinnedSpikeTrain([spike_trains[cc] for cc in range(num_units)],
-                                                       bin_size=0.001 * pq.s)
-            binned_spike_trains_10ms = BinnedSpikeTrain([spike_trains[cc] for cc in range(num_units)],
-                                                        bin_size=0.01 * pq.s)
-        
-        
-        all_cchs_1ms = np.zeros((num_units, num_units, WINDOW_SIZE))
-        all_cchs_10ms = np.zeros((num_units, num_units, WINDOW_SIZE))
-        all_ccs = np.zeros((num_units, num_units))
-        
-        print("Generating Params")
-        cch_params = []
-        for i, ci in tqdm(enumerate(unit_indices), total=len(unit_indices)):
-            overlaps = dtab.at[ci, 'rf_overlaps'].a
-            paired_units = []
-            for j, ci2 in enumerate(unit_indices):
-                if i >= j:
-                    continue
-                if overlaps[ci2] < OVERLAP_THRESHOLD:
-                    paired_units.append(j)
-            cch_params.append((i, paired_units, binned_spike_trains_1ms, binned_spike_trains_10ms))
-        
-        print("Calculating CCHs")
-        with mp.Pool(MP_N_THREADS) as pool:
-            half_cchs = list(tqdm(pool.istarmap(calculate_cchs, cch_params),total=len(cch_params)))
-            pool.close()
-            pool.join() 
-        
-        for i, param in enumerate(cch_params):
-            ci_index, ci2_indices, _, _ = param
-            ci = unit_indices[ci_index]
-            for j, ci2_index in enumerate(ci2_indices):
-                all_cchs_1ms[ci_index, ci2_index, :] = half_cchs[i][0][j]
-                all_cchs_10ms[ci_index, ci2_index, :] = half_cchs[i][1][j]
-                all_cchs_1ms[ci2_index, ci_index, :] = np.flip(half_cchs[i][0][j])
-                all_cchs_10ms[ci2_index, ci_index, :] = np.flip(half_cchs[i][1][j])
-                all_ccs[ci_index, ci2_index] = half_cchs[i][1][j][(WINDOW_SIZE-1)//2]
-                all_ccs[ci2_index, ci_index] = half_cchs[i][1][j][(WINDOW_SIZE-1)//2]
-            
-            cchs_1ms = {ci2: all_cchs_1ms[i,j,:] for j, ci2 in enumerate(unit_indices)}
-            cchs_10ms = {ci2: all_cchs_10ms[i,j,:] for j, ci2 in enumerate(unit_indices)}
-            ccs = {ci2: all_ccs[i,j] for j, ci2 in enumerate(unit_indices)}
-            
-            dtab.at[ci, '1ms CCHs'] = wrapper(cchs_1ms)
-            dtab.at[ci, '10ms CCHs'] = wrapper(cchs_10ms)
-            dtab.at[ci, 'CCs'] = wrapper(ccs)
-        
-        self.update_valid_columns(ct, di)
-
         
 class Feature_cross_correlations_complete_fast(Feature):
     name = 'calculate cross correlations'
     requires = {'unit':{'spike_times'}}
-    provides = {'unit':{'1ms CCHs', '10ms CCHs','CCH_delays'}}
+    provides = {'dataset':{'cch_1ms', 'cch_10ms','cch_delays', 'cch_ids'}}
     
     def generate(self, ct, unit_indices, inpt, dtab=None):
         if dtab is None:
@@ -464,7 +305,6 @@ class Feature_cross_correlations_complete_fast(Feature):
         
         # make much faster CCH
 
-        # delays_half = np.around(np.concatenate((np.arange(0, .051, .001),np.arange(.051, .15, .002))), 3) * pq.s
         delays_half = np.around(np.arange(0, .101, .001), 3) * pq.s
         # delays = np.around(np.logspace(-3, -.5, 15), 4)
         # delays = np.concatenate([[0],delays]) * pq.s
@@ -508,12 +348,9 @@ class Feature_cross_correlations_complete_fast(Feature):
         cch_10ms = np.concatenate([np.flip(cch_all_10ms, 2), np.swapaxes(cch_all_10ms, 0,1)[...,1:]], axis=2)
         delays = np.concatenate([-np.flip(delays_half), delays_half[1:]])
             
-        for i, ci in enumerate(unit_indices):
-            cchs_1ms = {ci2: cch_1ms[i,j,:] for j, ci2 in enumerate(unit_indices)}
-            cchs_10ms = {ci2: cch_10ms[i,j,:] for j, ci2 in enumerate(unit_indices)}
-            
-            dtab.at[ci, '1ms CCHs'] = wrapper(cchs_1ms)
-            dtab.at[ci, '10ms CCHs'] = wrapper(cchs_10ms)
-            dtab.at[ci, 'CCH_delays'] = wrapper(delays)
+        ct.dataset_table.at[di, 'cch_1ms'] = wrapper(np.around(cch_1ms, decimals=6))
+        ct.dataset_table.at[di, 'cch_10ms'] = wrapper(np.around(cch_10ms, decimals=6))
+        ct.dataset_table.at[di, 'cch_delays'] = wrapper(delays)
+        ct.dataset_table.at[di, 'cch_ids'] = wrapper(unit_indices)
         
         self.update_valid_columns(ct, di)
