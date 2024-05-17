@@ -116,8 +116,8 @@ class Feature_load_manual_labels(Feature):
     """
     name = 'load manual labels'
     requires = {'unit':{'unit_id'}}
-    provides = {'unit':{'label_manual_text_input'}}
-    input = {'analysis_data'}
+    provides = {'unit':{'label_manual_text'}}
+    input = {'analysis_data', 'params'}
 
     def generate(self, ct, unit_indices, inpt, dtab=None):
         if dtab is None:
@@ -134,6 +134,7 @@ class Feature_load_manual_labels(Feature):
 
         if len(mode) == 0:
             print('... Label mode is empty in dataset, filling all "unlabeled"')
+            dtab.loc[unit_indices, 'label_manual_text'] = 'unlabeled'
             dtab.loc[unit_indices, 'label_manual_text_input'] = 'unlabeled'
 
         elif mode == 'alexandra':
@@ -144,7 +145,7 @@ class Feature_load_manual_labels(Feature):
 
             if run_ids is None:
                 print('ERROR: missing manual labels for this dataset, filling empty strings')
-                dtab.loc[unit_indices, 'label_manual_text_input'] = ''
+                dtab.loc[unit_indices, 'label_manual_text'] = ''
 
             # for cc, ci in enumerate(unit_indices):
             #     label = 'unlabeled'
@@ -160,14 +161,20 @@ class Feature_load_manual_labels(Feature):
             for index, row in vision_ids.iterrows():
                 for uid in row[run_id]:
                     ci = (dataset['piece_id'], dataset['run_id'], uid)
-                    dtab.at[ci, 'label_manual_text_input'] = spelling_correct_type(row['label_manual_text'])
+                    dtab.at[ci, 'label_manual_text'] = spelling_correct_type(row['label_manual_text'])
+                    dtab.at[ci, 'label_manual_text_input'] = dtab.at[ci, 'label_manual_text']
                     dtab.at[ci, 'alex_id'] = index
 
         elif mode == 'list':
             print('... reading vision-style types in a list document from {}'.format(dataset['label_data_path']))
             vision_ids_this_dataset = np.array(dtab.loc[unit_indices, 'unit_id'])
-            file = open(dataset['label_data_path'],'r')
+            try:
+                file = open(dataset['label_data_path'],'r')
+            except FileNotFoundError:
+                print(f'ERROR: cannot find label file at {dataset["label_data_path"]}')
+                return
 
+            unit_indices_filled = []
             for line in file:
                 # print(line)
                 unit_id,label = line.split('  ')
@@ -180,8 +187,12 @@ class Feature_load_manual_labels(Feature):
                     continue
                 label = label.strip('\n')
                 label = label.replace('All/', '')
-                label = label[:-1]
-                label = label.replace('/',' ')
+                if len(label) == 0:
+                    label = 'unlabeled'
+                else:
+                    if label[-1] in ['/', ' ']:
+                        label = label[:-1]
+                    label = label.replace('/',' ')
                 label = spelling_correct_type(label)
                 # print(label)
                 # if label == 'All/ON/midget/' or label == 'All/':
@@ -194,12 +205,19 @@ class Feature_load_manual_labels(Feature):
                 #     label = 'OFF parasol'
                 # if label == 'All/blue/nc32/':
                 #     label = 'christmas'
+                dtab.at[unit_indices[index], 'label_manual_text'] = label
                 dtab.at[unit_indices[index], 'label_manual_text_input'] = label
+                unit_indices_filled.append(unit_indices[index])
+
+            for ui in unit_indices:
+                if ui not in unit_indices_filled:
+                    dtab.at[ui, 'label_manual_text'] = 'unlabeled'
+                    dtab.at[ui, 'label_manual_text_input'] = 'unlabeled'
 
         elif mode == 'combined':
             print('reading combined dataset export')
             # data = io.loadmat(dataset['label_data_path'])
-            # dtab.loc[unit_indices, 'label_manual_text_input'] = [spelling_correct_type(t[0][0]) for t in data['labels']]
+            # dtab.loc[unit_indices, 'label_manual_text'] = [spelling_correct_type(t[0][0]) for t in data['labels']]
 
             path = dataset['label_data_path']
             print(f'... label path: {path}')
@@ -220,8 +238,8 @@ class Feature_load_manual_labels(Feature):
                     vision_id_data001 = np.nan
                 dtab.at[ci, 'unit_id_data001'] = vision_id_data001
 
+                dtab.at[ci, 'label_manual_text'] = spelling_correct_type(label)
                 dtab.at[ci, 'label_manual_text_input'] = spelling_correct_type(label)
-
 
         elif mode == 'vision':
             print('using vision types')
@@ -233,10 +251,15 @@ class Feature_load_manual_labels(Feature):
                 # if not isinstance(typ, str):
                 # print('typ {}'.format(typ))
                     # typ = ''
+            dtab.loc[unit_indices, 'label_manual_text'] = labels
             dtab.loc[unit_indices, 'label_manual_text_input'] = labels
         else:
             print('!!! unknown label mode')
 
+        # show some debug
+        labels = dtab.loc[unit_indices, 'label_manual_text']
+        unique_labels = np.unique(labels[pd.notna(labels)])
+        print(f'... found {len(unique_labels)} unique labels, such as {", ".join(unique_labels[:4])}')
         self.update_valid_columns(ct, di)
 
 
@@ -265,11 +288,11 @@ def simplify_alexandra_labels(labels):
 
 class Feature_simplify_label_text(Feature):
     name = 'simplify label text'
-    requires = {'unit':{'label_manual_text_input'}}
+    requires = {'unit':{'label_manual_text'}}
     provides = {'unit':set()}
     input = {'analysis_data'}
 
-    def generate(self, ct, unit_indices, inpt, dtab=None):
+    def generate(self, ct, unit_indices, inpt=None, dtab=None):
         if dtab is None:
             dtab = ct.unit_table
         di = unit_indices[0][0:2]
@@ -278,8 +301,8 @@ class Feature_simplify_label_text(Feature):
             return
 
         print('... simplifying text labels')
-        dtab.loc[unit_indices, 'label_manual_text_input'] = simplify_alexandra_labels(
-            dtab.loc[unit_indices, 'label_manual_text_input'])
+        dtab.loc[unit_indices, 'label_manual_text'] = simplify_alexandra_labels(
+            dtab.loc[unit_indices, 'label_manual_text'])
 
 
 class Feature_process_manual_labels(Feature):
@@ -288,7 +311,7 @@ class Feature_process_manual_labels(Feature):
     provides = {'unit':set()}
     input = {''}
 
-    def generate(self, ct, unit_indices, inpt, dtab=None):
+    def generate(self, ct, unit_indices, inpt=None, dtab=None):
         if dtab is None:
             dtab = ct.unit_table
         di = unit_indices[0][0:2]
@@ -296,67 +319,83 @@ class Feature_process_manual_labels(Feature):
         #     print('Feature {}. missing requirements {}'.format(self.name, missing))
         #     return
 
-        if 'label_manual_text_input' in ct.dataset_table.at[di, 'valid_columns_unit'].a:
-            source = 'label_manual_text_input'
-            output = 'label_manual_input'
-        else:
-            source = 'label_manual_text'
-            output = 'label_manual'
-        print(f'...Using label source {source}')
+        print('... this feature has been deprecated.')
 
-        label_manual_text = dtab.loc[unit_indices,source]
-        types_nan = [not isinstance(l, str) for l in label_manual_text]
-        label_manual_text[types_nan] = 'wasnan'
+        # if 'label_manual_text' in ct.dataset_table.at[di, 'valid_columns_unit'].a:
+        #     source = 'label_manual_text'
+        #     output = 'label_manual'
+        # else:
+        #     source = 'label_manual_text'
+        #     output = 'label_manual'
+        # print(f'...Using label source {source}')
+        #
+        # label_manual_text = dtab.loc[unit_indices,source]
+        # types_nan = [not isinstance(l, str) for l in label_manual_text]
+        # label_manual_text[types_nan] = 'wasnan'
 
-        le = LabelEncoder()
-        label_manual = le.fit_transform(label_manual_text)
-        label_manual_uniquenames = le.classes_
-        ct.pdict['label_manual_uniquenames'] = label_manual_uniquenames
-        num_types = len(label_manual_uniquenames)
-        dtab.loc[unit_indices, output] = label_manual
-        print(f'... Found {num_types} cell types, storing label_manual_uniquenames in ct.pdict')
+        # le = LabelEncoder()
+        # label_manual = le.fit_transform(label_manual_text)
+        # label_manual_uniquenames = le.classes_
+        # ct.pdict['label_manual_uniquenames'] = label_manual_uniquenames
+        # num_types = len(label_manual_uniquenames)
+        # dtab.loc[unit_indices, output] = label_manual
+        # print(f'... Found {num_types} cell types, storing label_manual_uniquenames in ct.pdict')
 
-        self.update_valid_columns(ct, di)
+        # self.update_valid_columns(ct, di)
 
 
 class Feature_load_dataset_metadata(Feature):
     name = 'load dataset metadata'
     requires = {'dataset':set(), 'unit':set()}
-    provides = {'dataset':{'location_eccentricity','location_angle','temperature','display','optics','lens','params_wn'}}
+    provides = {'dataset':{'location_eccentricity','location_angle','temperature','display','optics','lens','params_wn','stimulus_type'}}
     input = {''}
 
     fn_runs = '/Volumes/Lab/Users/scooler/database_spreadsheet/database_spreadsheet_runs.csv'
     fn_pieces = '/Volumes/Lab/Users/scooler/database_spreadsheet/database_spreadsheet_pieces.csv'
 
-    def generate(self, ct, unit_indices, inpt, dtab=None):
-        if dtab is None:
-            dtab = ct.unit_table
+    def generate(self, ct, unit_indices, inpt=None, dtab=None):
         di = unit_indices[0][0:2]
         if (missing := self.check_requirements(ct, di)) is not None:
             print('Feature {}. missing requirements {}'.format(self.name, missing))
             return
 
         fail = False
-        di = unit_indices[0][0:2]
-        piece = ct.dataset_table.loc[di,'piece_id']
-        run = ct.dataset_table.loc[di,'run_id']
-        if len(run) > 3:
-            run = run[:3]
-        error = False
+        piece = ct.dataset_table.loc[di, 'piece_id']
+        run_id = ct.dataset_table.loc[di, 'run_id']
+        if len(run_id) > 3:
+            run = run_id[:3]
 
         table_runs = pd.read_csv(self.fn_runs)
-        s = f'datarun == "data{run}" and Piece == "{piece}"'
+        s = f'datarun == "data{run_id}" and Piece == "{piece}"'
         try:
             table_runs_row = table_runs.query(s).iloc[0]
 
             # print(s, table_runs_row)
-            temp, display, optics, lens = table_runs_row[
+            temp, display_type, optics, lens = table_runs_row[
                 ['temperature', 'display (CRT, OLED)', 'optics (below, above)', 'objective lens']]
-            type, color, interval, rgb, seed, stixel_width, stixel_height = table_runs_row[
-                ['type', 'BW/RGB', 'interval', 'rgb', 'seed', 'stixel width', 'stixel height']]
+            stim_type, color, interval, contrast, seed, stixel_width, stixel_height, field_width, field_height, exp_type, jitter = table_runs_row[
+                ['type', 'BW/RGB', 'interval', 'contrast', 'seed', 'stixel width', 'stixel height', 'field width', 'field height', 'exp type', 'jitter']]
+            if not color == 'BW':
+                color = 'RGB'
+            jitter = not (isinstance(jitter, float) and np.isnan(jitter))
 
-            ct.dataset_table.loc[di, ['temperature','display','optics','lens']] = [temp, display, optics, lens]
-            ct.dataset_table.loc[di, 'params_wn'] = file_handling.wrapper({'type':type, 'color':color, 'interval':interval, 'rgb':rgb, 'seed':seed, 'stixel width':stixel_width, 'stixel_height':stixel_height})
+
+            ct.dataset_table.loc[di, ['temperature', 'display', 'optics', 'lens']] = [temp, display_type, optics, lens]
+            ct.dataset_table.loc[di, 'params_wn'] = file_handling.wrapper(
+                {'type': stim_type, 'color': color, 'interval': interval, 'contrast':contrast, 'seed': seed, 'stixel_width': stixel_width,
+                 'stixel_height': stixel_height, 'field_width': field_width, 'field_height': field_height, 'jitter': jitter})
+
+            print(f'Got metadata: type: {stim_type}, color: {color}, interval: {interval}, contrast: {contrast}, seed: {seed},'
+                  f' stixel width: {stixel_width}, stixel height: {stixel_height}, field width: {field_width}, field height: {field_height}, exp type: {exp_type}, jitter: {jitter}')
+            print(f'Got metadata: temp: {temp}, display: {display_type}, optics: {optics}, lens: {lens}')
+
+            if stim_type in ['binary']:
+                stimulus_type = 'whitenoise'
+            elif stim_type in ['NSEM']:
+                stimulus_type = 'nsem'
+            else:
+                stimulus_type = f'{exp_type} {stim_type}'
+            ct.dataset_table.loc[di, 'stimulus_type'] = stimulus_type
 
         except:
             print(f'Run table query {s} failed')
@@ -366,8 +405,9 @@ class Feature_load_dataset_metadata(Feature):
         s = f'Date == "{piece}"'
         try:
             table_pieces = table_pieces.query(s).iloc[0]
-            eccentricity, angle = table_pieces[['Eccentricity (mm)', 'Angle (clock angle)']]
-            ct.dataset_table.loc[di, ['location_eccentricity', 'location_angle']] = [eccentricity, angle]
+            eccentricity, angle, eye, array, rig = table_pieces[['Eccentricity (mm)', 'Angle (clock angle)', 'Eye (L/R)', 'Array ID/ Board', 'Rig']]
+            ct.dataset_table.loc[di, ['location_eccentricity', 'location_angle', 'eye','array','rig']] = [eccentricity, angle, eye, array, rig]
+            print(f'Got metadata: eccentricity: {eccentricity}, angle: {angle}')
         except:
             print(f'Piece table query {s} failed')
             fail = True
@@ -389,7 +429,7 @@ class Feature_load_dataset_metadata(Feature):
 #         for ci in unit_indices:
 #             index_export = dtab.at[ci, 'id_e']
 #             lab = label_data_manual[index_export][0][0]
-#             dtab.at[ci, 'label_manual_text_input'] = lab
+#             dtab.at[ci, 'label_manual_text'] = lab
 #
 #
 # class Feature_load_export_data(Feature):

@@ -4,31 +4,28 @@ import importlib
 import sys
 # sys.path.append('../')
 sys.path.append('/Volumes/Lab/Development/artificial-retina-software-pipeline/utilities/')
-
+sys.path.append('/Volumes/Lab/Users/scooler/pylib/MEA/src/analysis/vision_utils')
 
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import warnings, time, colorsys, datetime, textwrap, pickle, os, random
+import warnings, time, colorsys, datetime, pickle, os, random
 from scipy.interpolate import griddata
 
 from scipy import stats, spatial, io, ndimage
-from shapely import geometry
 from skimage import measure
 from matplotlib import  cm
-from sklearn.preprocessing import LabelEncoder
 from datetime import datetime
-from neo import SpikeTrain
-from elephant.conversion import BinnedSpikeTrain
-from elephant.spike_train_correlation import correlation_coefficient, cross_correlation_histogram
-import quantities as pq
+
 from tqdm import tqdm
-import re
+import re, time
 
 import visionloader as vl
 import file_handling
 import features as feat
+import features_visual
+
 
 def pretty(gg):
     print('shape: {}'.format(gg.shape))
@@ -101,6 +98,43 @@ def colorsets(colorset=0):
     return colors
 
 
+def write_log_entry(piece_id, step, log_file=None):
+    if log_file is None:
+        log_file = '/Volumes/Scratch/Analysis/process_status.csv'
+    if not os.path.exists(log_file):
+        lf = pd.DataFrame(columns=['start'])
+        lf.index.name = 'piece_id'
+        lf.to_csv(log_file)
+
+    # touch lock file
+    lock_file = log_file + '.lock'
+    counter = 0
+    while os.path.exists(lock_file):
+        print('Waiting for lock file to clear')
+        time.sleep(1)
+        counter += 1
+        if counter > 10:
+            print('Lock file exists for 10 seconds, writing anyway')
+            break
+
+    with open(lock_file, 'w') as f:
+        f.write('')
+        f.close()
+
+    try:
+        lf = pd.read_csv(log_file, index_col='piece_id')
+        lf.loc[piece_id, step] = pd.Timestamp.now()
+        lf.to_csv(log_file)
+        print(f'Logged {step} for {piece_id}')
+    except Exception as e:
+        print(f'Error writing log entry: {e}')
+
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+        except:
+            print('Lock file already gone...')
+
 def make_plot_format(types, colorset=1):
     colors = colorsets(colorset)
 
@@ -108,6 +142,7 @@ def make_plot_format(types, colorset=1):
     color_indices = {'other': 0, 'blue': 0, 'ON': 0, 'OFF': 0}
     color_order_by_group = {'other': np.random.permutation(colors), 'blue': np.random.permutation(colors),
                             'ON': np.random.permutation(colors), 'OFF': np.random.permutation(colors)}
+    types = np.unique(types)
     for typ in types:
         if 'ON OFF' in typ:
             group = 'other'
@@ -126,6 +161,7 @@ def make_plot_format(types, colorset=1):
             color = color_order_by_group[group][color_indices[group]]
         color_indices[group] += 1
         type_format[typ] = {'group': group, 'color': color}
+        # print(typ, group, color)
     type_format = pd.DataFrame(type_format).T
     return type_format
 
@@ -151,9 +187,9 @@ def channelize(words):
     return colis
 
 def cid_to_str(cid,uid=None):
-    o = f'{cid[0]}:c{cid[1]}'
+    o = f'{cid[0]}: c{cid[1]}'
     if uid is not None:
-        o += f'u{uid}'
+        o += f' u{uid}'
     return o
 
 
@@ -163,6 +199,23 @@ def new_dataset_dict():
                     'stimulus_type':[], 'species':[]}
     return dataset_dict
 
+def dataset_dict_fill_defaults(dd):
+    # dataset dict has to have equal-length entries to generate the dataframe
+    # so we fill in defaults for any missing entries
+    defaults = {'sorter': '', 'labels': '', 'note': '', 'label_data_path': '', 'sta_path': '', 'ei_path': '', 'stimulus_type': '', 'species': ''}
+
+
+    count = 0
+    for key in dd.keys():
+        if isinstance(dd[key], list):
+            count = max(count, len(dd[key]))
+    print(f'Filling dataset_dict with {count} total entries')
+    for key in dd.keys():
+        while len(dd[key]) < count:
+            if key not in defaults:
+                raise ValueError(f'No default for {key}, needs to be manually specified')
+            dd[key].append(defaults[key])
+    return dd
 
 def make_paths(ct, piece_id, run_id, analysis_path=None, run_file_name=None, verbose=False, export_path_base=None, sta_path_base=None, sorter='kilosort'):
     if export_path_base is None:
@@ -197,9 +250,6 @@ def make_paths(ct, piece_id, run_id, analysis_path=None, run_file_name=None, ver
     label_mode = ''
     if not os.path.isfile(label_data_path):
         label_data_path = f'{analysis_path}/{run_file_name}.classification_scooler.txt'
-        label_mode = 'list'
-    if not os.path.isfile(label_data_path):
-        label_data_path = f'{analysis_path}/{run_file_name}.classification_bhofflic.txt'
         label_mode = 'list'
     if not os.path.isfile(label_data_path):
         label_data_path = f'{analysis_path}/{run_file_name}.classification_agogliet.txt'
@@ -250,6 +300,34 @@ def make_paths(ct, piece_id, run_id, analysis_path=None, run_file_name=None, ver
     return label_mode, label_data_path, sta_path, ei_path
 
 
+def filter_types(types, filter_types=None, additional=None):
+    """
+    Filters out types that are not useful for display
+    :param types: input list of strings
+    :param filter_types: optional filter list
+    :param additional: additional filter list
+    :return: filtered list
+    """
+    if additional is None:
+        additional = []
+    if filter_types is None:
+        filter_types = ['crap', 'bad', 'other', 'weird', 'contamin', 'edge', 'weak', 'unlabel', 'nan',
+                        'Unclassified', 'unclass', 'mess', 'artifact', 'dupli', 'unclear', 'check']
+    filter_types.extend(additional)
+
+    out = []
+    for typ in list(types):
+        include = True
+        if not isinstance(typ, str):
+            typ = str(typ)
+        for ft in filter_types:
+            if ft in typ:
+                include = False
+        if include:
+            out.append(typ)
+
+    return out
+
 def find_wn_runs(piece_id, filter_bw=False, filter_large_stixel=False):
     """
     Finds white noise runs using the database spreadsheet. Searches for simple standard WN runs by default.
@@ -261,9 +339,9 @@ def find_wn_runs(piece_id, filter_bw=False, filter_large_stixel=False):
     fn_runs = '/Volumes/Lab/Users/scooler/database_spreadsheet/database_spreadsheet_runs.csv'
 
     table_runs = pd.read_csv(fn_runs)
-    s = f"Piece == @piece_id and `exp type` == 'Visual' and `jitter` != 1.0 and type == 'binary' and loop != '1'"
+    s = f"Piece == '{piece_id}' and `exp type` == 'Visual' and `jitter` != 1.0 and type == 'binary' and loop != '1'"
     table_runs = table_runs.query(s)
-    table_runs = table_runs.astype({'stixel width': 'float', 'interval': 'float'})
+    table_runs = table_runs.astype({'stixel_width': 'float', 'interval': 'float'})
     if filter_bw:
         table_runs = table_runs.query("`BW/RGB` == 'RGB'")
     if filter_large_stixel:
@@ -272,6 +350,7 @@ def find_wn_runs(piece_id, filter_bw=False, filter_large_stixel=False):
     # display(table_runs)
 
     run_ids = [d[-3:] for d in table_runs['datarun']]
+    run_ids = np.sort(run_ids)
     return run_ids
 
 
@@ -325,7 +404,7 @@ def get_piece_directory(ct, piece_id, make=True):
     :param make:
     :return:
     """
-    piece_directory = f"{ct.paths['h5_labels']}/{piece_id}/"
+    piece_directory = f"{ct.paths['scratch_analysis']}/{piece_id}/"
     if os.path.exists(piece_directory):
         return piece_directory
     else:
@@ -335,6 +414,152 @@ def get_piece_directory(ct, piece_id, make=True):
         else:
             return None
 
+
+def find_sta_dims_by_run(ct, piece_id, run_ids):
+    data = {run_id: {} for run_id in run_ids if run_id != 'com'}
+    print('Loading STA dimensions from several sources')
+
+    for run_id in run_ids:
+        if run_id == 'com':
+            continue
+
+        dataset = ct.dataset_table.loc[(piece_id, run_id)]
+        if dataset['display'] == 'OLED':
+            res = [800, 600]
+        else:
+            res = [640, 320]
+
+        field_height = dataset['params_wn'].a['field_height']
+        field_width = dataset['params_wn'].a['field_width']
+        if not (isinstance(field_height, float) and np.isnan(field_height)):
+            shape_sheet = (int(field_width), int(field_height))
+        else:
+
+            stixel = int(dataset['params_wn'].a['stixel_width'])
+            shape_sheet = tuple([r // stixel for r in res])
+        print(f'Spreadsheet {run_id} has {shape_sheet}')
+        data[run_id]['database'] = shape_sheet
+
+        # continue
+        sta_file = f'data{run_id}.sta'
+        path_vision = f'/Volumes/Analysis/{piece_id}/data{run_id}/'
+        path_kilosort = f'/Volumes/Analysis/{piece_id}/kilosort_data{run_id}/data{run_id}/'
+        names = ['vision', 'kilosort']
+
+        for name, path in zip(names, [path_vision, path_kilosort]):
+            if os.path.exists(path + sta_file):
+                try:
+                    print(f'Loading {name} STA for run {run_id}')
+                    analysis_data = vl.load_vision_data(path, f'data{run_id}',
+                                                        include_neurons=True,
+                                                        include_sta=True)
+
+                    vision_ids_this_dataset = analysis_data.get_cell_ids()
+                    S = features_visual.load_vision_sta(analysis_data, vision_ids_this_dataset[0])[3]
+                    print(f'Found {name} STA for run {run_id} with shape {S.shape}')
+                    data[run_id][name] = S.shape[:2]
+                except:
+                    print(f'Error loading STA for run {run_id} with {name} at {path}')
+                    data[run_id][name] = np.nan
+            else:
+                data[run_id][name] = np.nan
+    data = pd.DataFrame(data)
+    print(data)
+
+    sta_dims_by_run = dict()
+    for run_id in run_ids:
+        if run_id == 'com':
+            continue
+        # check if each entry is the same
+        resolutions = [r for r in data[run_id].values if isinstance(r, tuple)]
+        res = np.unique(resolutions, axis=0)
+        print(f'Have {res.shape[0]} unique resolutions for run {run_id}')
+        if res.shape[0] > 1:
+            print(f'Run {run_id} has different resolutions for different analysis methods: {res}')
+            chosen = data[run_id]['kilosort']
+            if not np.isnan(chosen).any():
+                print(f'Using kilosort resolution: {chosen}')
+                if data[run_id]['database'] == chosen:
+                    print('Database resolution matches kilosort resolution')
+                else:
+                    print(f'Database resolution does not match kilosort resolution: {data[run_id]["database"]}')
+            else:
+                print(f'Kilosort resolution is NaN, using database resolution {data[run_id]["database"]}')
+                chosen = data[run_id]['database']
+            sta_dims_by_run[run_id] = chosen
+        else:
+            print(f'Run {run_id} has resolution {res[0]}')
+            chosen = res[0]
+
+        sta_dims_by_run[run_id] = tuple(chosen)
+    return sta_dims_by_run
+
+
+def get_stimulus_path(dataset, wn_spatial_resolution=None):
+    if 'params_wn' in dataset:
+        wn_params = dataset.params_wn.a
+    else:
+        ValueError(f'No white noise parameters found for dataset {dataset.name}')
+
+    try:
+        disp = dataset['display']
+    except:
+        raise ValueError(f'No display type found for dataset {dataset.name}')
+    if disp == 'CRT':
+        res = [640, 320]
+        rate = '119.5'
+    elif disp == 'OLED':
+        res = [800, 600]
+        rate = '60.35'
+    else:
+        res = [640, 320]
+        rate = '119.5'
+        disp = 'CRT'
+        print(f'Unknown display type {disp}, assuming cropped CRT')
+    print(f'Found display type {disp} with resolution {res} and refresh rate {rate} Hz')
+
+    print('Looking for STA dimensions')
+    if wn_spatial_resolution is not None:
+        sta_dimensions = wn_spatial_resolution
+    else:
+        sta_dimensions = None
+        if 'sta_dimensions' in dataset:
+            if isinstance(dataset['sta_dimensions'], float) and np.isnan(dataset['sta_dimensions']):
+                sta_dimensions = None
+            else:
+                sta_dimensions = dataset['sta_dimensions'].a[:2]
+                print(f'Found STA dimensions {sta_dimensions} from already loaded STA')
+        if sta_dimensions is None:
+            try:
+                sta_dimensions = [int(wn_params['field_width']), int(wn_params['field_height'])]
+                print(f'Found STA dimensions {sta_dimensions} from field parameters in database spreadsheet')
+                if sta_dimensions[0] / sta_dimensions[1] > 1.5:
+                    wn_crop = True
+            except:
+                pass
+        if sta_dimensions is None:
+            sta_dimensions = np.array(res) / int(wn_params['stixel_height'])
+            print(f'Calculated STA dimensions {sta_dimensions} from stixel height in white noise parameters (might have crop wrong)')
+    if sta_dimensions is None:
+        ValueError('No STA dimensions found')
+
+    stimuli = []
+    stimulus_base = f'{wn_params["color"]}-{wn_params["stixel_height"]}-{int(wn_params["interval"])}-{wn_params["contrast"]}-{wn_params["seed"]}'
+
+    stimuli.append(f'{stimulus_base}-{int(sta_dimensions[0])}x{int(sta_dimensions[1])}-{rate}')
+    stimuli.append(f'{stimulus_base}-{int(sta_dimensions[0])}x{int(sta_dimensions[1])}')
+    stimuli.append(f'{stimulus_base}-{rate}')
+    stimuli.append(stimulus_base)
+
+    stimulus_out = None
+    for stimulus in stimuli:
+        path = '/Volumes/Analysis/stimuli/white-noise-xml/' + stimulus + '.xml'
+        print(f'Checking for {path}')
+        if os.path.isfile(path):
+            stimulus_out = stimulus
+            print(f'Found!')
+            break
+    return stimulus_out
 
 class CellTable:
     """
@@ -468,9 +693,25 @@ class CellTable:
 
         indices = self.dataset_table.query(f"piece_id == '{piece_id}' and run_id == '{run_id}'").index
         self.log(f'Dropping {len(indices)} datasets')
-        self.dataset_table.drop(index=indices, inplace=True)
+        if len(indices) > 0:
+            self.dataset_table.drop(index=indices, inplace=True)
 
-        self.log('Still need to handle the cells containing these units!')
+        self.log(f'Removing units from {run_id} from cell_table')
+        try:
+            cell_indices = self.cell_table.query(f"piece_id == '{piece_id}'").index
+        except:
+            print('No cell_table defined')
+            cell_indices = []
+        if len(cell_indices) > 0:
+            for ci in cell_indices:
+                units = self.cell_table.at[ci, 'unit_ids']
+                units_out = [uid for uid in units if uid[1] != run_id]
+                self.cell_table.at[ci, 'unit_ids'] = tuple(units_out)
+
+                unit_ids_by_run = self.cell_table.at[ci, 'unit_ids_by_run'].a
+                unit_ids_by_run.pop(run_id, None)
+                self.cell_table.at[ci, 'unit_ids_by_run'] = file_handling.wrapper(unit_ids_by_run)
+            self.log('NB: there might be cells with no units now')
 
     def drop_noncom(self):
         print('Dropping all runs except combined')
@@ -535,8 +776,10 @@ class CellTable:
                 vision_ids_this_dataset = list(self.dataset_table.at[di, 'unit_ids'].a)
 
             # add units to the units table
-            index = pd.MultiIndex.from_product(([di[0]],[di[1]], vision_ids_this_dataset), names=('piece_id','run_id','unit_id'))
-            unit_table_add = pd.DataFrame({'unit_id':vision_ids_this_dataset, 'dataset_id':[di for a in range(len(vision_ids_this_dataset))], 'run_id':di[1], 'piece_id':di[0], 'valid':True}, index=index)
+            index = pd.MultiIndex.from_product(([di[0]], [di[1]], vision_ids_this_dataset), names=('piece_id', 'run_id', 'unit_id'))
+            unit_table_add = pd.DataFrame({'unit_id': vision_ids_this_dataset,
+                                           'dataset_id': [di for a in range(len(vision_ids_this_dataset))],
+                                           'run_id': di[1], 'piece_id': di[0], 'valid': True}, index=index)
 
             if index[0] in self.unit_table.index:
                 self.log(f'Error: unit {index[0]} is already present in the unit_table, may already have initialized these units. Halting.', 2)
@@ -679,6 +922,7 @@ class CellTable:
             piece_ids = [piece_ids]
 
         self.log(f'Saving {len(piece_ids)} pieces, to {file_root}')
+        self.log(piece_ids)
 
         if save_name is not None:
             self.log(f'Saving entire datasets table for later per-piece file loading')
@@ -689,7 +933,7 @@ class CellTable:
 
         tim = Timer(start=True, count=len(piece_ids))
         for pp, piece_id in enumerate(piece_ids):
-
+            print(f'Saving piece {piece_id}')
            # save the units for this piece, from multiple datasets
             cells = self.cell_table.query(f"piece_id == '{piece_id}'").copy()
             units = self.unit_table.query(f"piece_id == '{piece_id}'").copy()
@@ -709,14 +953,14 @@ class CellTable:
 
     def file_load_pieces(self,
                            file_root=None,
-                           pieces=None,
+                           piece_ids=None,
                            save_name=None,
                            count=None,
                            process_labels=True,
                            ):
         """
         Load internal tables from per-dataset pickle files
-        :param file_root:
+        :param file_root: 'scratch' if you want to load from the scratch directory
         :param pieces:
         :param save_name:
         :param count:
@@ -732,20 +976,20 @@ class CellTable:
             fname = f'{file_root}/ctds_{save_name}.pkl'
             self.dataset_table = pd.read_pickle(fname)
 
-        if pieces is None:
-            pieces = np.array(self.dataset_table.piece_id.unique())
-        if isinstance(pieces, str):
+        if piece_ids is None:
+            piece_ids = np.array(self.dataset_table.piece_id.unique())
+        if isinstance(piece_ids, str):
             print('pieces is a string, converting to list')
-            pieces = [pieces]
+            piece_ids = [piece_ids]
 
         if count is not None:
             assert False
-            pieces = pieces[:count]
+            piece_ids = piece_ids[:count]
             self.dataset_table = self.dataset_table.loc[pieces]
 
-        self.log(f'Loading {len(pieces)} pieces from {file_root}: {pieces}')
-        tim = Timer(start=True, count=len(pieces))
-        for pp, piece_id in enumerate(pieces):
+        self.log(f'Loading {len(piece_ids)} pieces from {file_root}: {file_root}')
+        tim = Timer(start=True, count=len(piece_ids))
+        for pp, piece_id in enumerate(piece_ids):
             try:
                 file_name = f'ctd_{piece_id}'
 
@@ -765,14 +1009,9 @@ class CellTable:
                 print(f'Failure loading piece {piece_id}')
                 raise
 
-        if process_labels:
+        if process_labels and 'label_manual_text' in self.cell_table.columns:
             self.log('Processing labels (replace nan, update label encoder and unique names)')
             self.cell_table.label_manual_text.fillna('unlabeled', inplace=True)
-            le = LabelEncoder()
-            label_manual = le.fit_transform(self.cell_table.label_manual_text)
-            self.cell_table['label_manual'] = label_manual
-            self.pdict['label_manual_uniquenames'] = le.classes_
-            # num_types = len(label_manual_uniquenames)
 
             # self.generate_features('all', [], [features.Feature_process_manual_labels])
             # self.cell_table.label_manual = self.get_label_encoder().transform(self.cell_table.label_manual_text.fillna(''))
@@ -784,22 +1023,181 @@ class CellTable:
                 print('combined mode')
                 for cid in cids:
                     uid = (cid[0], 'com', cid[1])
-                    self.unit_table.loc[uid, ['label_manual', 'label_manual_text']] = \
-                        self.cell_table.loc[cid, ['label_manual', 'label_manual_text']]
+                    self.unit_table.loc[uid, 'label_manual_text'] = self.cell_table.loc[cid, 'label_manual_text']
             else:
                 for cid in cids:
                     for uid in self.cell_table.at[cid, 'unit_ids']:
-                        self.unit_table.loc[uid, ['label_manual', 'label_manual_text']] = \
-                            self.cell_table.loc[cid, ['label_manual', 'label_manual_text']]
+                        self.unit_table.loc[uid, 'label_manual_text'] = self.cell_table.loc[cid, 'label_manual_text']
 
         self.log('Done loading, time to analyze.')
 
     def drop_cells(self, cell_ids):
         pass
 
+    def save_neurons_files(self, piece_id, save_path=None, include_all_units=False):
+        """
+        Save merged neurons file (vision format) to a new directory
+        :param piece_id:
+        :param save_path:
+        :param include_all_units: normally, only valid units within valid cells are included. This will include all units
+        :return:
+        """
+        import visionloader as vl
+        import visionwriter as vw
+        if save_path is None:
+            save_path = f'/Volumes/Scratch/Analysis/{piece_id}/neurons_merged/'
+        os.makedirs(save_path, exist_ok=True)
+        print(f'Saving merged neurons to {save_path}')
+
+        for run_id in self.dataset_table.query(f'piece_id == "{piece_id}"')['run_id'].unique():
+            vision_data_path = self.dataset_table.loc[(piece_id, run_id), 'path']
+            if run_id == 'com':
+                print('No spikes saved for combined run')
+                continue
+            if len(vision_data_path) == 0:
+                print(f'No vision data path for {piece_id} {run_id}')
+                continue
+            vcd = vl.load_vision_data(vision_data_path, self.dataset_table.loc[(piece_id, run_id), 'run_file_name'],
+                                      include_neurons=True,
+                                      include_ei=False,
+                                      include_params=False,
+                                      include_runtimemovie_params=False, )
+
+            spike_times_by_unit_id = dict()
+
+            if include_all_units:
+                uids = self.unit_table.query(f'piece_id == "{piece_id}" and run_id == "{run_id}"').index
+            else:
+                # only include valid units within valid cells
+                uids = []
+                for cell_id in self.cell_table.query(f'piece_id == "{piece_id}" and valid == True').index:
+                    uids_by_run = self.cell_table.loc[cell_id, 'unit_ids_by_run'].a
+                    if run_id in uids_by_run and len(uids_by_run[run_id]) > 0:
+                        uid = uids_by_run[run_id][0]
+                        uids.append(uid)
+            merged = np.sum(self.unit_table.loc[uids]['unit_id'] > 90000)
+            print(f'Found {len(uids)} units for {piece_id} {run_id} including {merged} merged units')
+            for uid in uids:
+                spike_times_by_unit_id[uid[2]] = self.unit_table.loc[uid, 'spike_times'].a
+
+            with vw.NeuronsFileWriter(save_path, f'data{run_id}') as nfw:
+                nfw.write_neuron_file(spike_times_by_unit_id, vcd.get_ttl_times(), vcd.get_n_samples())
+        print('done')
+        return save_path
+
+    def save_params_file(ct, piece_id, run_id, file_path_output=None):
+        import vision_utils  # Mike's code
+
+        try:
+            dataset = ct.dataset_table.query(f"run_id == '{run_id}' and piece_id == '{piece_id}'").iloc[0]
+        except:
+            print(f"Run {run_id} not found with piece {piece_id}")
+            return
+        run_file_name = dataset['run_file_name']
+        if file_path_output is None:
+            file_path_output = f'/Volumes/Scratch/Analysis/{piece_id}/{run_file_name}/{run_file_name}.params'
+
+        unit_ids = ct.unit_table.query(f"piece_id == '{piece_id}' and run_id == '{run_id}'").index
+        unit_ids_export = ct.unit_table.loc[unit_ids, 'unit_id'].values
+
+        print(f'Exporting {len(unit_ids_export)} units to {file_path_output}')
+        wr = vision_utils.ParamsWriter(filepath=file_path_output, cluster_id=unit_ids_export)
+
+        # process rf size and center
+        stixel_size = dataset['stimulus_params'].a['stixel_size']
+        x0 = ct.unit_table.loc[unit_ids, 'rf_center_x'] / stixel_size
+        y0 = ct.unit_table.loc[unit_ids, 'rf_center_y'] / stixel_size
+        sig_stixels = ct.unit_table.loc[unit_ids, 'map_sig_stixels']
+        rf_counts = []
+        for map in sig_stixels:
+            if not isinstance(map, float):
+                rf_counts.append(np.sum(map.a))
+            else:
+                rf_counts.append(0)
+        rf_counts = np.array(rf_counts)
+        sigma_x = np.sqrt(rf_counts) / 3
+        sigma_y = sigma_x
+
+        # process spike count
+        spike_count = ct.unit_table.loc[unit_ids, 'spike_count'].values.astype(int)
+
+        # process acf
+        if 'acf' in ct.unit_table.columns:
+            col = 'acf'
+        else:
+            col = 'isid'
+        acf = ct.unit_table.loc[unit_ids, col]
+        acf_out = []
+        for k in acf:
+            try:
+                acf_out.append(k.a)
+            except:
+                acf_out.append(np.zeros_like(acf_out[0]))
+        acf = np.stack(acf_out, axis=0)
+
+        # process tc
+        tc = ct.unit_table.loc[unit_ids, 'tc_all']
+        # tc dims: cell, time, color
+        tc_shape = [len(unit_ids), tc[0].a.shape[0], 3]
+        tc_out = []
+        for k in tc:
+            if isinstance(k, float):
+                tc_out.append(np.zeros_like(tc_out[0]))
+                continue
+            tc_simple = []
+            for color in range(3):
+                on = k.a[:, color * 2]
+                off = k.a[:, color * 2 + 1]
+                if np.max(np.abs(on)) > np.max(np.abs(off)):
+                    tc_simple.append(on)
+                else:
+                    tc_simple.append(off)
+            tc_out.append(np.stack(tc_simple, axis=1))
+        tc = np.stack(tc_out, axis=0)
+
+        wr.write(tc, acf, spike_count, x0, y0, sigma_x, sigma_y, isi_binning=0.5)
+        print("Wrote parameters file.")
+
+    def initialize_cell_table_from_units(self, unit_ids, cell_start_index=0):
+        piece_id = unit_ids[0][0]
+        cell_table_dict = dict()
+        # unit_ids = pd.MultiIndex.from_tuples(self.dataset_table.loc[di].unit_ids.a)
+        cell_table_dict['unit_ids'] = [(ind,) for ind in unit_ids]
+        cell_table_dict['unit_ids_by_run'] = [file_handling.wrapper({ind[1]: (ind,)}) for ind in unit_ids]
+        cell_table_dict['unit_ids_wn'] = [tuple() for ind in unit_ids]
+        cell_table_dict['unit_id_wn_combined'] = [np.nan for ind in unit_ids]
+        cell_table_dict['unit_id_nsem'] = [np.nan for ind in unit_ids]
+
+        cell_table_dict['corr_included'] = [[] for ind in unit_ids]
+        cell_table_dict['merge_scores'] = [[] for ind in unit_ids]
+        try:
+            # cell_table_dict['label_manual'] = np.array(self.unit_table.loc[unit_ids, 'label_manual_input'])
+            cell_table_dict['label_manual_text'] = np.array(self.unit_table.loc[unit_ids, 'label_manual_text'])
+        except:
+            self.log('failed to move label_manual from units to cells')
+
+        # cell_table_dict['dataset_id'] = [di for a in unit_ids]
+        cell_table_dict['piece_id'] = piece_id
+        cell_table_dict['merge_strategy'] = ''
+        cell_table_dict['valid'] = np.array(self.unit_table.loc[unit_ids, 'valid'])
+
+        # for c in cell_table_dict.keys():
+        #     print(c)
+        #     v = cell_table_dict[c]
+        #     try:
+        #         print(len(v))
+        #     except:
+        #         print(v)
+
+        cell_index_numbers = np.arange(len(unit_ids)) + cell_start_index
+        index = pd.MultiIndex.from_product([[piece_id], cell_index_numbers], names=['piece_id', 'cell_id'])
+        cell_table_add = pd.DataFrame(cell_table_dict, index=index)
+
+        return cell_table_add
+
     def initialize_cell_table(self, pieces=None):
         """
-        Starts a new cell_table for this CellTable, with one cell for each unit.
+        Starts a new cell_table for this CellTable, with one cell for each unit, across all pieces
         :param pieces: list of piece_id strings
         :return:
         """
@@ -814,50 +1212,19 @@ class CellTable:
             unit_ids = pd.MultiIndex.from_tuples(np.concatenate([u.a for u in datasets.unit_ids]))
             print(f'Piece {piece_id} has {len(unit_ids)} units from {datasets.shape[0]} datasets')
 
-            cell_table_dict = dict()
-            # unit_ids = pd.MultiIndex.from_tuples(self.dataset_table.loc[di].unit_ids.a)
-            cell_table_dict['unit_ids'] = [(ind,) for ind in unit_ids]
-            cell_table_dict['unit_ids_by_run'] = [file_handling.wrapper({ind[1]:(ind,)}) for ind in unit_ids]
-            cell_table_dict['unit_ids_wn'] = [tuple() for ind in unit_ids]
-            cell_table_dict['unit_id_wn_combined'] = [np.nan for ind in unit_ids]
-            cell_table_dict['unit_id_nsem'] = [np.nan for ind in unit_ids]
-
-            cell_table_dict['corr_included'] = [[] for ind in unit_ids]
-            cell_table_dict['merge_scores'] = [[] for ind in unit_ids]
-            try:
-                cell_table_dict['label_manual'] = np.array(self.unit_table.loc[unit_ids, 'label_manual_input'])
-                cell_table_dict['label_manual_text'] = np.array(self.unit_table.loc[unit_ids, 'label_manual_text_input'])
-            except:
-                self.log('failed to move label_manual')
-
-            # cell_table_dict['dataset_id'] = [di for a in unit_ids]
-            cell_table_dict['piece_id'] = piece_id
-            cell_table_dict['merge_strategy'] = ''
-            cell_table_dict['valid'] = np.array(self.unit_table.loc[unit_ids, 'valid'])
-
-            # for c in cell_table_dict.keys():
-            #     print(c)
-            #     v = cell_table_dict[c]
-            #     try:
-            #         print(len(v))
-            #     except:
-            #         print(v)
-
-            cell_index_numbers = np.arange(len(unit_ids))
-            index = pd.MultiIndex.from_product([[piece_id], cell_index_numbers], names=['piece_id', 'cell_id'])
-            cell_table_add = pd.DataFrame(cell_table_dict, index=index)
+            cell_table_add = self.initialize_cell_table_from_units(unit_ids)
+            index = cell_table_add.index
             self.cell_table = pd.concat([self.cell_table, cell_table_add], copy=False)
 
             # store cell_id in each unit
-            # index = pd.MultiIndex.from_product([[di], unit_ids])
             self.unit_table.loc[unit_ids, 'cell_id'] = index.to_numpy()
 
         # move label input to label for each unit, to be deduplicated for some cells
-        try:
-            self.unit_table['label_manual_text'] = self.unit_table['label_manual_text_input']
-            self.unit_table['label_manual'] = self.unit_table['label_manual_input']
-        except:
-            self.log('failed to move label_manual')
+        # try:
+        #     self.unit_table['label_manual_text'] = self.unit_table['label_manual_text_input']
+        #     self.unit_table['label_manual'] = self.unit_table['label_manual_input']
+        # except:
+        #     self.log('failed to move label_manual')
 
         self.cell_table['unit_ids'] = self.cell_table['unit_ids'].astype(object)
         self.cell_table['unit_id_nsem'] = self.cell_table['unit_id_nsem'].astype(object)
@@ -870,26 +1237,30 @@ class CellTable:
     #     deduplication.deduplicate(self, use_sta,do_combine_unit_data, verbose, pieces)
     #     print('Deduplication complete.')
 
-    def copy_cell_labels_to_units(self, source_table=None, label_source='manual'):
+    def copy_cell_labels_to_units(self, source_table=None, label_source='manual', piece_id=None):
         if source_table is None:
             source_table = self.cell_table
         print(f'Copying cell {label_source} labels to units')
         cids = source_table.index
+        if piece_id is not None:
+            cids = source_table.query(f"piece_id == '{piece_id}'").index
         for cid in tqdm(cids, ncols=40, total=len(cids)):
-            for uid in self.cell_table.at[cid, 'unit_ids']:
-                self.unit_table.loc[uid, [f'label_{label_source}', f'label_{label_source}_text']] = \
-                    source_table.loc[cid, [f'label_{label_source}', f'label_{label_source}_text']]
+            label = source_table.loc[cid, f'label_{label_source}_text']
+            uids = source_table.at[cid, 'unit_ids']
+            for uid in uids:
+                self.unit_table.at[uid, f'label_{label_source}_text'] = label
+
         print('done')
 
     def copy_unit_labels_to_cells(self):
         # such as after Alexandra updates the manual labels
-        for col in ['label_manual', 'label_manual_text']:
-            self.unit_table[col] = self.unit_table[col + '_input']
+        # for col in ['label_manual', 'label_manual_text']:
+        #     self.unit_table[col] = self.unit_table[col + '_input']
 
         cell_ids = self.cell_table.index
         for ci in tqdm(cell_ids, ncols=40):
             uids = pd.MultiIndex.from_tuples(self.cell_table.loc[ci, 'unit_ids'])
-            label_text = self.unit_table.loc[uids, 'label_manual_text_input'].to_numpy()
+            label_text = self.unit_table.loc[uids, 'label_manual_text'].to_numpy()
 
             # evaluate labels and see which is better
             scores = []
@@ -919,25 +1290,26 @@ class CellTable:
 
             # alternatively, use label_out = labels[0] # just pick the highest one, should be fine, but will lose some possible info
             # move labels from best unit (_input) into cell
-            for col in ['label_manual', 'label_manual_text']:
-                self.cell_table.at[ci, col] = self.unit_table.at[uid_selected, col + '_input']
+            for col in ['label_manual_text']: #'label_manual',
+                self.cell_table.at[ci, col] = self.unit_table.at[uid_selected, col]# + '_input']
         print('Done moving labels')
 
-    def copy_unit_labels_to_cells_combined(self):
+    def copy_unit_labels_to_cells_combined(self, piece_id=None):
         print('copying unit labels to cells (combined)')
-        self.unit_table['label_manual_text'] = self.unit_table['label_manual_text_input']
-        self.unit_table['label_manual'] = self.unit_table['label_manual_input']
-        units = self.unit_table.query(f"run_id == 'com'")
+        # self.unit_table['label_manual_text'] = self.unit_table['label_manual_text_input']
+        # self.unit_table['label_manual'] = self.unit_table['label_manual_text']
+        if piece_id is None:
+            print('for all pieces')
+            units = self.unit_table.query(f"run_id == 'com'")
+        else:
+            print(f'for piece {piece_id}')
+            units = self.unit_table.query(f"piece_id == '{piece_id}' and run_id == 'com'")
         for uid, unit in units.iterrows():
             # print(uid, unit['label_manual_text_input'])
-            self.cell_table.loc[(uid[0], uid[2]), 'label_manual'] = unit['label_manual_input']
-            self.cell_table.loc[(uid[0], uid[2]), 'label_manual_text'] = unit['label_manual_text_input']
+            # self.cell_table.loc[(uid[0], uid[2]), 'label_manual'] = unit['label_manual']#_input']
+            self.cell_table.loc[unit['cell_id'], 'label_manual_text'] = unit['label_manual_text']#_input']
         print(f'Done for {units.shape[0]} cells')
 
-    def get_label_encoder(self): # deprecated
-        le = LabelEncoder()
-        le.classes_ = self.pdict['label_manual_uniquenames']
-        return le
 
     def make_label_table(self, dtab):
         label_table = pd.DataFrame(index=dtab.index)
@@ -949,9 +1321,9 @@ class CellTable:
         return label_table
 
     # DATASET ACCESS
-    def cid_to_uid(self, cell_ids, stimulus_type='whitenoise', use_combined=True, use_combined_only=False):
+    def cid_to_uid(self, cell_ids, stimulus_type='whitenoise', use_combined=True,
+                   run_ids=None, remove_missing=True):
         '''
-
         :param cell_ids:
         :param stimulus_type: for now, 'whitenoise' is all but we should be able to select other units
         :param use_combined: return the combined dataset units (from deduplication)
@@ -959,29 +1331,38 @@ class CellTable:
         :return: list of unit ids
         '''
         # look up units for each cell using basic merge strategies
+        # input checking:
+        if len(cell_ids) == 0:
+            return []
+
+        if len(cell_ids[0]) == 3:
+            # print('cell_ids are already unit_ids, returning them')
+            return cell_ids
+
         unit_ids = []
         for ci, cell_id in enumerate(cell_ids):
             cell = self.cell_table.loc[cell_id]
-            if stimulus_type == 'nsem':
-                try:
-                    unit_id = cell.unit_id_nsem.a
-                except:
-                    unit_id = cell.unit_ids[0]
-            else:
-                if use_combined and stimulus_type == 'whitenoise' and len(cell.unit_ids_wn) > 0:
-                    unit_id = (cell_id[0], 'com', cell_id[1])
+
+            if run_ids is None:
+                if use_combined:
+                    run_ids = ['com']
                 else:
-                    if use_combined_only:
-                        unit_id = np.nan
-                    else:
+                    run_ids = cell['unit_ids_by_run'].a.keys()
 
-                        unit_id = cell.unit_ids[0] # choose the first one
-
-            # if cell.merge_strategy == 'h':
+            if stimulus_type == 'nsem' and 'unit_id_nsem' in cell:
+                unit_id = cell.unit_id_nsem.a
+            else:
+                unit_id = np.nan
+                for run_id in run_ids:
+                    if run_id in cell['unit_ids_by_run'].a and len(cell['unit_ids_by_run'].a[run_id]) > 0:
+                        unit_id = cell['unit_ids_by_run'].a[run_id][0]
+                        break
+            if remove_missing and isinstance(unit_id, float) and np.isnan(unit_id):
+                continue
             unit_ids.append(unit_id)
         return unit_ids
 
-    def get_cells(self, cell_ids=None, reset_index=False, columns=None, generate=False, types=None, datasets=None, use_combined=True, use_combined_only=False):
+    def get_cells(self, cell_ids=None, types=None, datasets=None, use_combined=True, use_combined_only=False, run_ids=None):
         # compose units into a table as cells
 
         if cell_ids is None: # get all cells
@@ -992,7 +1373,7 @@ class CellTable:
         if types is not None or datasets is not None:
             cell_ids = self.cell_selection(types=types, datasets=datasets)
 
-        unit_ids = self.cid_to_uid(cell_ids, use_combined=use_combined, use_combined_only=use_combined_only)
+        unit_ids = self.cid_to_uid(cell_ids, use_combined=use_combined, run_ids=run_ids)
         cell_ids_out = []
         unit_ids_out = []
         for uid, cid in zip(unit_ids, cell_ids):
@@ -1190,7 +1571,7 @@ class CellTable:
         return features_to_run
 
 
-    def get_vision_data(self, dataset, load_sta=None, load_ei=None):
+    def get_vision_data(self, dataset, load_sta=None, load_ei=None, load_params=None):
         """
         gets an analysis_data object from vision loader for data loading from vision files
         :param dataset: row in the ct.dataset_table
@@ -1202,7 +1583,8 @@ class CellTable:
         load_analysis_data = len(dataset['path']) > 0
         if load_analysis_data:
             # load_labels = len(dataset['labels']) > 0
-            load_labels = dataset['labels'] == 'vision'
+            if load_params is None:
+                load_params = dataset['labels'] == 'vision'
             ei_path = dataset['ei_path']
             load_long_ei = os.path.isfile(ei_path)
             if load_ei is None:
@@ -1216,7 +1598,7 @@ class CellTable:
             # load_labels = False
             # print(f'trying EI path {ei_path}')
 
-            print(f'Loading vision data (thanks Eric), using load_sta {load_sta}, load_labels {load_labels}, load_ei {load_ei}, load_long_ei {load_long_ei}')
+            print(f'Loading vision data (thanks Eric), using load_sta {load_sta}, load_labels (params) {load_params}, load_ei {load_ei}, load_long_ei {load_long_ei}')
 
             try:
                 run_file_name = dataset['run_file_name']
@@ -1230,7 +1612,7 @@ class CellTable:
 
             a = vl.load_vision_data(dataset['path'],
                                     run_file_name,
-                                    include_params=load_labels,
+                                    include_params=load_params,
                                     # needs to be True to load cell types from vision
                                     include_ei=load_ei,
                                     include_sta=load_sta,
@@ -1248,9 +1630,11 @@ class CellTable:
                 # print(f'ei_path redone: {ei_path}')
                 # print('copying globals file')
 
-                import shutil
-                globals_path = dataset['path'] + f'/{run_file_name}.globals'
-                shutil.copyfile(globals_path, ei_path + f'/{run_file_name}.globals')
+                # check if globals file exists with long EI, else copy it
+                if not os.path.isfile(ei_path + f'/{run_file_name}.globals'):
+                    import shutil
+                    globals_path = dataset['path'] + f'/{run_file_name}.globals'
+                    shutil.copyfile(globals_path, ei_path + f'/{run_file_name}.globals')
 
                 # print(a.main_datatable)
                 with vl.EIReader(ei_path, run_file_name) as eir:
@@ -1292,7 +1676,10 @@ class CellTable:
                           force_features=False,
                           load_analysis_data=True,
                           ignore_errors=False,
-                          autosave_interval=None):
+                          input_parameters=None,
+                          autosave_interval=None,
+                          include_invalid_units=False,
+                          dtab=None):
         """
         generates features as requested. Handles errors, looping, etc
         :param unit_indices: indices of units to run on, use 'all' for all
@@ -1305,12 +1692,14 @@ class CellTable:
         :param force_features:
         :param load_analysis_data:
         :param ignore_errors:
+        :param input_parameters: dict of parameters to pass to features
         :param autosave_interval:
         :return:
         """
-
+        if dtab is None:
+            dtab = self.unit_table
         if isinstance(unit_indices, str) and unit_indices == 'all':
-            unit_indices = np.array(self.unit_table.index)
+            unit_indices = np.array(dtab.index)
         if big_columns_per_dataset is None:
             big_columns_per_dataset = ['ei', 'ei_grid', 'sta', 'sta_var']
         if big_columns_overall is None:
@@ -1320,52 +1709,79 @@ class CellTable:
 
         features_active = set()
         # process per-dataset features
-        datasets_to_process = np.unique(self.unit_table.loc[unit_indices, 'dataset_id'])
-        # datasets_to_process = [1]
+        # datasets_to_process = np.unique(dtab.loc[unit_indices, 'dataset_id'])
+        datasets_to_process = [tuple(a) for a in np.unique(
+            [(unit['piece_id'], unit['run_id']) for uid, unit in dtab.loc[unit_indices].iterrows()], axis=0)]
 
         tim = Timer(start=True, count=len(datasets_to_process))
-
-        failures = {'di':[],'feature':[]}
+        failures = {'di': [], 'feature': []}
 
         if len(features_to_activate_per_dataset) > 0:
             load_sta = False
             load_ei = False
+            load_params = False
             for feat_class in features_to_activate_per_dataset:
-                if 'ei' in feat_class.input:
+                if 'ei' in feat_class.input and load_ei is False:
                     load_ei = True
-                if 'sta' in feat_class.input:
+                    print(f'Feature {feat_class} requires EI, so loading it')
+                if 'sta' in feat_class.input and load_sta is False:
                     load_sta = True
+                    print(f'Feature {feat_class} requires STA, so loading it')
+                if 'params' in feat_class.input and load_params is False:
+                    load_params = True
+                    print(f'Feature {feat_class} requires params, so loading it')
 
             for dd, di in enumerate(datasets_to_process):
                 dataset = self.dataset_table.loc[di]
-                # display(dataset)
-
                 self.log(f'\n\nGenerating features for dataset {di}, {dd+1} of {len(datasets_to_process)}')
 
                 if load_analysis_data:
-                    analysis_data = self.get_vision_data(dataset, load_sta=load_sta, load_ei=load_ei)
+                    load_params_this_dataset = load_params
+                    load_sta_this_dataset = load_sta
+                    load_ei_this_dataset = load_ei
+                    if load_params:
+                        params_path = os.path.join(dataset['path'], dataset["run_file_name"] + '.params')
+                        if not os.path.isfile(params_path):
+                            print(f'No params file found at {params_path}, loading analysis data without it')
+                            load_params_this_dataset = False
+                    if load_sta:
+                        sta_path = os.path.join(dataset['path'], dataset["run_file_name"] + '.sta')
+                        if not os.path.isfile(sta_path):
+                            print(f'No STA file found at {sta_path}, loading analysis data without it')
+                            load_sta_this_dataset = False
+                    if load_ei:
+                        ei_path = os.path.join(dataset['path'], dataset["run_file_name"] + '.ei')
+                        if not os.path.isfile(ei_path):
+                            print(f'No EI file found at {ei_path}, loading analysis data without it')
+                            load_ei_this_dataset = False
+
+                    analysis_data = self.get_vision_data(dataset, load_sta=load_sta_this_dataset, load_ei=load_ei_this_dataset, load_params=load_params_this_dataset)
                     inpt = {'analysis_data': analysis_data}
                 else:
                     inpt = dict()
+                if input_parameters is not None:
+                    print('updating input parameters')
+                    inpt.update(input_parameters)
 
                 for fi, feat_class in enumerate(features_to_activate_per_dataset):
                     feature = feat_class()
                     self.log('Feature: {}'.format(feature))
 
-                    # get all valid indices in this dataset
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        indices = self.unit_table.loc[di].index
-
-                    indices = pd.MultiIndex.from_product([[di[0]],[di[1]],indices], names=['dataset_id','run_id','unit_id'])
-                    indices = indices[self.unit_table.loc[indices,'valid']]
+                    # get all (valid) unit indices in this dataset
+                    if not include_invalid_units:
+                        indices = dtab.loc[unit_indices].query('dataset_id == @di and valid == True').index
+                        print(f'Found {len(indices)} valid units in dataset {di}')
+                    else:
+                        indices = dtab.loc[unit_indices].query('dataset_id == @di').index
+                        invalid_count = np.count_nonzero(dtab.loc[indices, 'valid'] == False)
+                        print(f'Found {len(indices)} units in dataset {di} (including {invalid_count} invalid units)')
                     if len(indices) == 0:
                         print('No valid units remaining in dataset {}'.format(di))
                         continue
 
                     # check if results are present already
                     if not force_features:
-                        provides_unit = feature.provides.get('unit',set())
+                        provides_unit = feature.provides.get('unit', set())
                         provides_dataset = feature.provides.get('dataset', set())
                         valid_columns_unit = dataset['valid_columns_unit'].a
                         valid_columns_dataset = dataset['valid_columns_dataset'].a
@@ -1380,7 +1796,8 @@ class CellTable:
                     # generate feature now
                     try:
                         # print(f'First index: {indices[0]}')
-                        feature.generate(self, indices, inpt)
+                        print(inpt)
+                        feature.generate(self, indices, inpt, dtab=dtab)
                         features_active.add(feat_class)
                     except Exception as e:
                         self.log('''
@@ -1493,6 +1910,7 @@ class CellTable:
                        dpi_scale=1, size_scale=1,
                        scale_bar_length=200,
                        row_labels=None,
+                       col_sta='sta',
                        transpose_plots=False,
                        split_timecourse=True,
                        spike_waveform_colname=None):
@@ -1502,9 +1920,9 @@ class CellTable:
             self.log('Empty cell index list provided', 2)
             return
         if dtab is None:
-            if len(cell_ids[0]) > 2:
-                print('Assuming input IDs are units, not cells')
-                dtab = self.unit_table.loc[cell_ids]
+            if len(cell_ids[0]) == 3:
+                # print('Assuming input IDs are units, not cells')
+                dtab = self.unit_table
             else:
                 dtab = self.get_cells(cell_ids)
         if plots is None:
@@ -1628,13 +2046,14 @@ class CellTable:
                 sta_peak = cell['map_sta_peak'].a
             except:
                 print('No STA peak map found')
-
+                sta_peak = None
             try:
                 timecourses = cell['tc'].a
             except:
                 print('No time courses found')
+                timecourses = None
             try:
-                S = cell['sta'].a
+                S = cell[col_sta].a
                 S_dims = S.shape
             except:
                 S = None
@@ -1666,8 +2085,13 @@ class CellTable:
             #     self.log('cell {} low spike count {}'.format(indices[ci], spike_count))
             #     continue
 
-            stimulus_params = dataset['stimulus_params'].a
-            stixel_size = stimulus_params['stixel_size']
+            try:
+                stimulus_params = dataset['stimulus_params'].a
+                stixel_size = stimulus_params['stixel_size']
+            except:
+                stixel_size = 40
+                stimulus_params = {'frame_time':.0333, 'stixel_size':stixel_size}
+                print(f'No stimulus params found, using stixel size {stixel_size} and frame_time {stimulus_params["frame_time"]}')
             # ic(stixel_size, stimulus_params['frame_time'])
             x_l = np.arange(S_dims[0]) * stixel_size
             y_l = np.arange(S_dims[1]) * stixel_size
@@ -1695,7 +2119,11 @@ class CellTable:
                 axis_sta = axs[ci, col]
                 # frames = np.clip(peak_frame_index + np.array([-1,0,1]), 0, S.shape[2]-1)
                 # peak_frame_composite = np.mean(S[:,:,frames,:], 2)
-                peak_frame_composite = cell['map_sta_peak'].a
+                try:
+                    peak_frame_composite = cell['map_sta_peak'].a
+                except:
+                    print('No STA peak map found, using zeros')
+                    peak_frame_composite = np.zeros([10,10, 3])
 
             # calibration bar
             if enable_zoom:
@@ -1762,22 +2190,34 @@ class CellTable:
             ## DISPLAY ACF
             if plot_acf:
                 plot_func = plt.plot
+                # if 'acf' in cell:
+                #     col_acf = 'acf'
+                # else:
+                col_acf = 'isid'
+                mode = 'lin'
+                # print(f'For spike timing, using {col_acf}')
                 try:
-                    acf = cell['acf'].a.astype(float)
+                    acf = cell[col_acf].a.astype(float)
                     if np.max(acf) > 0:
                         acf /= np.max(acf)
-                    x_acf = dataset['acf_bins'].a
-                    if x_acf[-1] > 10:
+                    x_acf = dataset[f'{col_acf}_bins_{mode}'].a
+                    diffs = np.diff(x_acf)
+                    if diffs[-1] > 2 * diffs[0]: # detect log spaced bins
                         plot_func = plt.semilogx
+                        print('using log x axis')
+                    # except:
+                    #     acf = [0]
+                    #     x_acf = [0]
+
+                    plt.sca(axs[ci, (col := col + 1)])
+                    plot_func(x_acf, acf, color='k')
+                    plt.yticks([])
+                    # plt.xticks([.02, 1000])
+                    # plt.title(f'peak {x_acf[np.argmax(acf)]:.0f} ms')
+                    col_title(axs[ci, col], ci, col_acf.upper())
                 except:
-                    acf = [0]
-                    x_acf = [0]
-                plt.sca(axs[ci, (col := col + 1)])
-                plot_func(x_acf, acf, color='k')
-                plt.yticks([])
-                # plt.xticks([.02, 1000])
-                # plt.title(f'peak {x_acf[np.argmax(acf)]:.0f} ms')
-                col_title(axs[ci, col], ci, 'ISI\nhistogram')
+                    print('No ACF found')
+                    col += 1
 
             if plot_spike_waveform:
                 if spike_waveform_colname is None:
@@ -2072,7 +2512,7 @@ class CellTable:
                 # display_fit_ellipse(fit, False)
                 # display_fit_ellipse_vision(fit_v)
                 # plt.title('{:.0f} spikes'.format(cell['spike_count']))
-                col_title(axis_sta, ci, 'STA peak frames\nmean of 3')
+                col_title(axis_sta, ci, f'{col_sta.upper()} peak frames\nmean of 3')
                 axis_sta.set_aspect('equal')
                 # axis_sta.get_xaxis().set_visible(False)
                 # axis_sta.get_yaxis().set_visible(False)
@@ -2216,7 +2656,7 @@ class CellTable:
                     threshold_multiplier=1.0,
                     segment_area_threshold = 80,
                     display_legend_index = False,
-                    invert_color_map = False,
+                    invert_color_map = True,
                     interpolation_mode='spline16'):
 
         '''
@@ -2225,7 +2665,7 @@ class CellTable:
         :param dtab:
         :param map_source:
         :param color_channels:
-        :param map_mode: 
+        :param map_mode:
         :param enable_display:
         :param display_contours:
         :param plot_hull_boundary:
@@ -2254,7 +2694,7 @@ class CellTable:
             return
         if dtab is None:
             if len(cell_ids[0]) > 2:
-                print('Assuming input IDs are units, not cells')
+                # print('Assuming input IDs are units, not cells')
                 dtab = self.unit_table.loc[cell_ids]
             else:
                 dtab = self.get_cells(cell_ids)
@@ -2378,6 +2818,7 @@ class CellTable:
                 segments_filtered = []
                 # loop over segments found
                 if len(segments):
+                    from shapely import geometry
                     for si, seg in enumerate(segments):
                         if seg.shape[0] < 3:
                             continue
@@ -2429,7 +2870,7 @@ class CellTable:
             # rf_map = np.mean(rf_map_sorted[:,:,-2:-1], axis=2)
             rf_map = np.max(map_coverage[...,:], axis=2) # max map
             if invert_color_map:
-                rf_map[rf_map > 0] += 0.5
+                rf_map[rf_map > 0] += 0 # .5
                 # print('max',np.max(rf_map))
             show(rf_map, 'auto', False, stimulus_params, contrast_multiplier=1.0, interpolation='spline16')
             if invert_color_map:
@@ -2548,7 +2989,11 @@ class CellTable:
         if display_scale_bar:
             # lower left horizontal:
             add = 0
-            plt.plot([mins[0]-add+50,mins[0]-add+scale_bar_length+50],[mins[1]-add+50,mins[1]-add+50],linestyle='-',color='white',linewidth=1)
+            if invert_color_map:
+                color = 'black'
+            else:
+                color = 'white'
+            plt.plot([mins[0]-add+500, mins[0]-add+scale_bar_length+500],[mins[1]-add+50,mins[1]-add+50],linestyle='-',color=color,linewidth=1)
             # upper left vertical:
             # plt.plot([mins[0],mins[0]],[maxs[1],maxs[1]-calib_length],linestyle='-',color='white',linewidth=1)
 
@@ -2572,13 +3017,16 @@ class CellTable:
     def find_primary_channel(self, cells):
         rf_ratio_green = []
         rf_ratio_blue = []
-        for e in cells['sta_extremes']:
-            extremes = e.a
-            green_on = np.abs(extremes[2])
-            green_off = np.abs(extremes[3])
-            blue = np.max(np.abs(extremes[4:6]))
-            rf_ratio_green.append((green_on - green_off) / (green_on + green_off + blue))
-            rf_ratio_blue.append(blue / np.max([green_on, green_off]))
+        # ignore runtimewarnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for e in cells['sta_extremes']:
+                extremes = e.a
+                green_on = np.abs(extremes[2])
+                green_off = np.abs(extremes[3])
+                blue = np.max(np.abs(extremes[4:6]))
+                rf_ratio_green.append((green_on - green_off) / (green_on + green_off + blue))
+                rf_ratio_blue.append(blue / np.max([green_on, green_off]))
         rf_ratio_green = np.median(rf_ratio_green)
         rf_ratio_blue = np.median(rf_ratio_blue)
         if rf_ratio_blue > 1:
@@ -2619,7 +3067,7 @@ class CellTable:
                         normalization=None):
         """
 
-        :param cid_lists:
+        :param cid_lists: indices should be multiindex
         :param names:
         :param indices:
         :param plots:
@@ -2682,8 +3130,12 @@ class CellTable:
         fig, axs = plt.subplots(nrows=num_rows, ncols=num_analyses, figsize=[num_analyses * 2.5 * size_scale + 3, num_rows * 2.5 * size_scale], dpi=60 * dpi_scale)
         if num_rows == 1 and num_analyses == 1:
             axs = np.array([axs])
-        if num_rows == 1:
             axs = axs[np.newaxis,:]
+        elif num_rows == 1:
+            axs = axs[np.newaxis,:]
+        elif num_analyses == 1:
+            axs = axs[:,np.newaxis]
+        print(f'num rows {num_rows}, num analyses {num_analyses}')
         outliers = []
         inliers = []
         # timecourses = pd.Series(dtab.tc.apply(lambda entry: entry.a[:,1:3].flatten(order='F')))
@@ -2692,6 +3144,7 @@ class CellTable:
         for tt, dat in enumerate(cid_lists):
             col = -1
             cell_ids, typ = dat
+            cell_ids = np.array(cell_ids)
             num_cells = len(cell_ids)
             scores = np.zeros([num_cells, 2])
             inliers = []
@@ -2703,7 +3156,12 @@ class CellTable:
                 # inliers.append()
                 continue
             if dtab is None:
-                cells = self.get_cells(cell_ids)
+                if len(cell_ids[0]) == 2:
+                    # input cell ids
+                    cells = self.get_cells(cell_ids)
+                elif len(cell_ids[0]) == 3:
+                    # input unit ids
+                    cells = self.unit_table.loc[cell_ids]
             else:
                 cells = dtab.loc[cell_ids]
             cell_example = cells.iloc[0]
@@ -2740,6 +3198,9 @@ class CellTable:
             # ACF, find outliers
             if plot_acf:
                 acf_log_mode = False
+                if not 'acf' in cell_example and acf_col == 'acf':
+                    print('No ACF data found, using ISID')
+                    acf_col = 'isid'
                 try:
                     acf = cell_example[acf_col].a.astype(float)
                     if np.max(acf) > 0:
@@ -2752,19 +3213,24 @@ class CellTable:
                     x_acf = dataset['acf_bins'].a
                     if x_acf[-1] > 10:
                         acf_log_mode = True
+                    assert len(x_acf) == acf.shape[0]
+
                 except:
-                    try:
-                        x_acf = np.linspace(1, 100, acf.shape[0])
-                    except:
-                        x_acf = np.linspace(1, 100, len(acf))
+                    x_acf = np.linspace(1, 200, len(acf))
                     acf_log_mode = False
-                acfs = np.stack([k.a / np.max(k.a) for k in cells['acf']])
+                acfs = np.stack([k.a / np.max(k.a) for k in cells[acf_col]])
                 acf_av = np.median(acfs, axis=0)
                 acf_var = stats.median_abs_deviation(acfs, axis=0) * var_multiplier
                 sel = acf_var > 0
                 sc = np.mean(np.abs((acfs[:,sel] - acf_av[sel]) / acf_var[sel]), axis=1)
                 # print(acf_av, acf_var, sc)
                 scores[:, 1] = sc
+
+                # downsample ACF
+                acfs = acfs[:,::2]
+                acf_av = acf_av[::2]
+                acf_var = acf_var[::2]
+                x_acf = x_acf[::2]
 
             # projection histograms
             if plot_projections:
@@ -2794,6 +3260,12 @@ class CellTable:
             distances = np.tril(spatial.distance.cdist(centers, centers, 'euclidean'), k=-1)
 
             if plot_best_correlation or plot_correlation_over_distance:
+
+                from neo import SpikeTrain
+                from elephant.conversion import BinnedSpikeTrain
+                from elephant.spike_train_correlation import correlation_coefficient, cross_correlation_histogram
+                import quantities as pq
+
                 # print(cells.iloc[0]['run_id'])
                 if cell_example['run_id'] == 'com':
                     # combined mode, need to find the run with the most cells having spikes
@@ -2836,8 +3308,6 @@ class CellTable:
                 warnings.simplefilter("ignore")
                 nnd = np.histogram(np.nanmin(dist_filt, axis=1), bins=nnd_bins)[0]
 
-
-
             ################################
             ################################
             ################################
@@ -2848,16 +3318,20 @@ class CellTable:
                 # if 'parasol' in typ['name'] or 'midget' in typ['name']:
                 #     tm = mosaic_threshold_multiplier * 4
                 # else:
-                tm = mosaic_threshold_multiplier
+                if isinstance(mosaic_threshold_multiplier, dict):
+                    tm = mosaic_threshold_multiplier[typ['name']]
+                else:
+                    tm = mosaic_threshold_multiplier
                 plt.sca(axs[tt, (col := col + 1)])
                 self.show_mosaic(cell_ids=cell_ids, color_channels=channelize([typ['channel']]),
                                zoom_to_hull=enable_mosaic_zoom,interpolation_mode=mosaic_interpolation_mode,
                                  threshold_multiplier=tm, scale_bar_length=scale_bar_length,
                                  annotations=mosaic_annotation, map_mode=mosaic_map_mode)
-                plt.gca().axis('off')
+                # all white axis
+                for spine in axs[tt, col].spines.values():
+                    spine.set_edgecolor('white')
                 if not svg_mode:
-                    plt.title(f'count {len(cell_ids)}')
-                if not svg_mode:
+                    # plt.title(f'count {len(cell_ids)}')
                     col_title(plt.gca(), tt, f'mosaic')
 
             if plot_ei_mosaic:
@@ -2891,13 +3365,12 @@ class CellTable:
             #                    zoom_to_hull=True, threshold_multiplier=tm, scale_bar_length=200)
             #     plt.title(f'count {len(cells_manual_ind)}')
             #     col_title(plt.gca(), tt, 'mosaic manual labels')
-
-            variance_fill_color = [.7,.7,.7]
+            variance_fill_color = [.7, .7, .7]
 
             # timecourses
             if plot_time_course:
                 plt.sca(axs[tt, (col := col + 1)])
-                for coli in [2,3,4]:
+                for coli in [2, 3, 4]:
                     offset = (coli - 2) * -1
                     sel = np.arange(tc.shape[1])
                     sel = np.logical_and(sel >= coli * tc.shape[1]/6, sel < (coli + 1) * tc.shape[1]/6)
@@ -2919,7 +3392,7 @@ class CellTable:
                     plt.plot(time_l, tc_av[sel]/scale+offset, linewidth=2, color=['r','r','g','g','b','b'][coli])
                     if not show_traces:
                         plt.fill_between(time_l, (tc_av[sel]-tc_var[sel])/scale+offset, (tc_av[sel]+tc_var[sel])/scale+offset, facecolor=variance_fill_color)
-                plt.xlim([-.35, 0])
+                plt.xlim([-.3, 0])
                 plt.yticks([])
                 # if tt < num_rows - 1:
                 #     plt.xticks([])
@@ -3030,7 +3503,6 @@ class CellTable:
                 if not svg_mode:
                     col_title(plt.gca(), tt, 'RF proj hist')
 
-
             # zscore distribution (errors scatter)
             # plt.sca(axs[tt, (col := col + 1)])
             # # plt.hist(scores[:,0])
@@ -3038,7 +3510,6 @@ class CellTable:
             # plt.xlabel('time course')
             # plt.ylabel('ACF')
             # col_title(plt.gca(), tt, 'error (sum norm diff from median)')
-
 
             # spatial distribution of correlation
             if plot_correlation_over_distance:
@@ -3062,7 +3533,6 @@ class CellTable:
                 # plt.title(typ)
                 if not svg_mode:
                     col_title(plt.gca(), tt, 'Spatial correlation')
-
 
             if plot_best_correlation:
                 # cross correlation histogram, best
@@ -3099,8 +3569,6 @@ class CellTable:
                 if not svg_mode:
                     col_title(plt.gca(), tt, 'RF area')
 
-
-
             if plot_example_cell:
                 for cc in range(num_example_cells):
                     plt.sca(axs[tt, (col := col + 1)])
@@ -3112,14 +3580,24 @@ class CellTable:
                     # print(f'example {cc} {cid}')
                     rf_map = example_cell['map_sta_peak'].a
                     stimulus_params = self.dataset_table.loc[di, 'stimulus_params'].a
-                    show(rf_map, 'auto', None, stimulus_params, contrast_multiplier=1,
-                         interpolation=example_interpolation_mode)
 
+                    # get spatial extents for plot
                     if normalization is not None:
                         zoom_span_scaled = zoom_span / np.sqrt(60000 / normalization.loc[cid[0], 'rf_size_green_hull'][0])
                     else:
                         zoom_span_scaled = zoom_span
                     xrange_zoom, yrange_zoom = spatial_zoom_region(example_cell['map_sig_stixels'].a, zoom_span_scaled, stimulus_params['stixel_size'])
+
+                    # draw gray rectangle
+                    from matplotlib.patches import Rectangle
+                    rect = Rectangle((xrange_zoom[0], yrange_zoom[0]), np.abs(xrange_zoom[0] - xrange_zoom[1]), np.abs(yrange_zoom[0] - yrange_zoom[1]),
+                                     color=[.5, .5, .5], zorder=0)
+                    plt.gca().add_patch(rect)
+
+                    # display image
+                    show(rf_map, 'auto', None, stimulus_params, contrast_multiplier=1,
+                         interpolation=example_interpolation_mode)
+
                     plt.xlim(xrange_zoom)
                     plt.ylim(yrange_zoom)
                     # print(xrange_zoom, yrange_zoom)
@@ -3157,9 +3635,10 @@ class CellTable:
 
                     row_label = f"{typ['name']}\nacc {f1:.2f}\npre {pre:.2f}  rec {rec:.2f}"
                 else:
-                    row_label = f"{typ['name']}"
+                    row_label = f"{typ['name']}\n({len(cell_ids)})"
             else:
                 row_label = f'{tt}'
+            # print(f'row label {row_label}')
             axs[tt, 0].annotate(row_label, xy=(0.02, 0.5), xytext=(-axs[tt, 0].yaxis.labelpad - 20, 0),
                                 xycoords=axs[tt, 0].yaxis.label, textcoords='offset points',
                                 size='x-large', ha='right', va='center',)
@@ -3168,7 +3647,7 @@ class CellTable:
                 plt.sca(axs[tt, (col := col + 1)])
                 col_title(axs[tt, col], tt, extra_title)
 
-        fig.tight_layout()
+        # fig.tight_layout()
 
 
         # Cell grids of outliers
@@ -3271,6 +3750,7 @@ def make_sta_dimensions(S, params, pdict=None):
         pdict['stixel_size'] = params['stixel_size']
 
     return x_l, y_l, X, Y, time_l
+
 
 
 # utility for aligning spike waveforms (or anything else)
@@ -3445,7 +3925,7 @@ def show(a, clims=None, cbar=True, stimulus_params=None, contrast_multiplier=1, 
             plt.imshow(np.clip(k / np.max(k) * 0.5 * contrast_multiplier + contrast_basis, 0, 1), origin='lower', extent=extent, interpolation=interpolation)
         else:
             plt.imshow(np.clip(k / -np.min(k) * 0.5 * contrast_multiplier + contrast_basis, 0, 1), origin='lower', extent=extent, interpolation=interpolation)
-        background_color = [contrast_basis,contrast_basis,contrast_basis]
+        background_color = [contrast_basis, contrast_basis, contrast_basis]
 
     elif k.ndim == 2:
         plt.imshow(k * contrast_multiplier, origin='lower', extent=extent, interpolation=interpolation)
@@ -3455,6 +3935,10 @@ def show(a, clims=None, cbar=True, stimulus_params=None, contrast_multiplier=1, 
         plt.clim(clims)
         cmap = plt.cm.get_cmap('viridis')
         background_color = cmap(clims[0])
+    else:
+        print('wrong number of dimensions: {}'.format(k.ndim))
+        background_color = [0,0,0]
+
 
     # plt.gca().invert_yaxis()
     plt.gca().set_aspect('equal')
@@ -3520,6 +4004,7 @@ def convex_hull(segments):
 
 
 def calculate_contour(rf_map, X, Y, contour_levels, contour_axis):
+    from shapely import geometry
     plt.sca(contour_axis)
     contour_axis.cla()
 
@@ -3541,6 +4026,7 @@ def calculate_contour(rf_map, X, Y, contour_levels, contour_axis):
 
     median_distance = np.zeros_like(contour_levels) * np.nan
     # loop over thresholds
+
     for threshi in range(len(contour_levels)):
         centers = []
         # loop over segments found
@@ -3749,6 +4235,7 @@ def analyze_fourier_ei(x_ei, y_ei, EI, mask_ei_variance, enable_display=True):
     # plt.figure()
     # display_ei(x_ei, y_ei, np.nanmax(soma_regions_by_cell, 2))
 
+
 def line_break(N=None):
     if N == 1:
         return '_/"-._/"-._/"-._/"-._/"-._/"-._/"-._/"-._/"-._/"-._/"-.'
@@ -3759,174 +4246,11 @@ def line_break(N=None):
 
     return '.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:._.:*~*:.'
 
-def plot_cell_cross_correlations(self,
-                            reference_cell_id,
-                            cell_ids=tuple(),
-                            dtab=None,
-                            cell_type_grouping = True,
-                            overlap_bounds = [0,1.5],
-                            individual_overlay = True,
-                            average_overlay = True,
-                            plot_individual_cchs = False,
-                            spike_bin_size = '10ms',
-                            show_cell_type = True,
-                            cols = 4):
-    plot_cols = cols
-    if len(cell_ids) == 0:
-        self.log('no cells to plot',2)
-        return
-    if dtab is None:
-        if len(cell_ids[0]) > 2:
-            print('Assuming input IDs are units, not cells')
-            dtab = self.unit_table.loc[cell_ids]
-        else:
-            dtab = self.get_cells(cell_ids)
-            
-    if len(reference_cell_id) > 2:
-        print('Assuming reference cell ID is a unit, not a cell')
-        ref_cell = self.unit_table.loc[reference_cell_id]
-    else:
-        ref_cell = self.get_cell(reference_cell_id)
-    ref_cchs = ref_cell[f"{spike_bin_size} CCHs"].a
-    overlaps = ref_cell['rf_overlaps'].a
-    window_size = len(list(ref_cchs.values())[0])
-    lags = np.array(range(int(-(window_size-1)/2),int((window_size-1)/2)+1))
-    
-    if cell_type_grouping:
-        types = dtab['label_manual_text'].unique()
-        
-        valid_types = []
-        all_type_cchs = {}
-        for ctype in types:
-            ctype_cells = dtab.query('label_manual_text == @ctype')
-            type_cchs = []
-            com_units = [self.cell_table.at[ref_cell.cell_id,'unit_id_wn_combined']]
-            for ci, (uid, unit2) in enumerate(ctype_cells.iterrows()):
-                if uid not in ref_cchs:
-                    continue
-                if np.sum(ref_cchs[uid]) == 0:
-                    continue
-                if overlaps[uid] <= overlap_bounds[0] or overlaps[uid] > overlap_bounds[1]:
-                    continue
-                if self.cell_table.at[unit2.cell_id,'unit_id_wn_combined'] not in com_units:
-                    com_units.append(self.cell_table.at[unit2.cell_id,'unit_id_wn_combined'])
-                else:
-                    continue
-                type_cchs.append(ref_cchs[uid])
-            if len(type_cchs) > 0:
-                valid_types.append(ctype)
-                all_type_cchs[ctype] = type_cchs
-            
-        if plot_individual_cchs: 
-            for ctype in valid_types:
-                cols = plot_cols
-                type_cchs = all_type_cchs[ctype]
-                if len(type_cchs) < cols:
-                    cols = len(type_cchs)
-                rows = int(np.ceil(len(type_cchs) / cols))
-                fig,axs = plt.subplots(rows,cols,figsize=(cols*5,rows*5))
-                for ti, cch in enumerate(type_cchs):
-                    if rows > 1:
-                        axs[ti//cols,ti%cols].plot(lags,cch)
-                        axs[ti//cols,ti%cols].set_title(f"{dtab.iloc[ti].name}")
-                    elif cols == 1:
-                        axs.plot(lags,cch)
-                        axs.set_title(f"{dtab.iloc[ti].name}")
-                    else:
-                        axs[ti%cols].plot(lags,cch)
-                        axs[ti%cols].set_title(f"{dtab.iloc[ti].name}")
-                if show_cell_type:
-                    fig.suptitle(f"Reference cell: {ref_cell.name}, {ref_cell['label_manual_text']}\n"
-                             + f"{ctype}, n = {len(type_cchs)}")     
-                else:
-                    fig.suptitle(f"Reference cell: {ref_cell.name}\n"
-                             + f"{ctype}, n = {len(type_cchs)}") 
-                fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-        else:
-            cols = plot_cols
-            if len(valid_types) < cols:
-                cols = len(valid_types)
-            rows = int(np.ceil(len(valid_types) / cols))
-            fig, axs = plt.subplots(rows, cols, figsize=[cols*5, rows*5])
-            
-            for ti, t in enumerate(valid_types):
-                type_cchs = all_type_cchs[t]
-                for typ_cch in type_cchs:
-                    if individual_overlay:
-                        if rows > 1:
-                            axs[ti//cols, ti%cols].plot(lags, typ_cch, alpha = 0.2)
-                        elif cols == 1:
-                            axs.plot(lags, typ_cch, alpha = 0.2)
-                        else:
-                            axs[ti%cols].plot(lags, typ_cch, alpha = 0.2)
-                if average_overlay:
-                    if rows > 1:
-                        axs[ti//cols, ti%cols].plot(lags, np.nanmean(type_cchs, axis=0), 
-                                                    color='k', linewidth=1)
-                    elif cols == 1:
-                        axs.plot(lags, np.nanmean(type_cchs, axis=0), 
-                                                    color='k', linewidth=1)
-                    else:
-                        axs[ti%cols].plot(lags, np.nanmean(type_cchs, axis=0), 
-                                                    color='k', linewidth=1)
-                if rows > 1:
-                    axs[ti//cols, ti%cols].set_title(f"{t}, n = {len(type_cchs)}")
-                    axs[ti//cols, ti%cols].set_xlabel('Time Lag(ms)')
-                    axs[ti//cols, ti%cols].set_ylabel('Correlation')
-                elif cols == 1:
-                    axs.set_title(f"{t}, n = {len(type_cchs)}")
-                    axs.set_xlabel('Time Lag (ms)')
-                    axs.set_ylabel('Correlation')
-                else:
-                    axs[ti%cols].set_title(f"{t}, n = {len(type_cchs)}")
-                    axs[ti%cols].set_xlabel('Time Lag(ms)')
-                    axs[ti%cols].set_ylabel('Correlation')
-            if show_cell_type:
-                plt.suptitle(f"Reference cell: {ref_cell.name}, {ref_cell['label_manual_text']}")
-            else:
-                plt.suptitle(f"Reference cell: {ref_cell.name}")
-            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    else:
-        all_cchs = []
-        com_units = [self.cell_table.at[ref_cell.cell_id,'unit_id_wn_combined']]
-        for ci, (uid, unit2) in enumerate(dtab.iterrows()):
-            if uid not in ref_cchs:
-                continue
-            if overlaps[uid] < overlap_bounds[0] or overlaps[uid] > overlap_bounds[1]:
-                continue
-            if self.cell_table.at[unit2.cell_id,'unit_id_wn_combined'] not in com_units:
-                com_units.append(self.cell_table.at[unit2.cell_id,'unit_id_wn_combined'])
-            else:
-                continue
-            all_cchs.append(ref_cchs[uid])
-        if plot_individual_cchs:
-            rows = int(np.ceil(len(all_cchs) / cols))
-            fig, axs = plt.subplots(rows, cols, figsize=[cols*5, rows*5])
-            for ti, cch in enumerate(all_cchs):
-                if rows > 1:
-                    axs[ti//cols, ti%cols].plot(lags, cch)
-                    axs[ti//cols, ti%cols].set_title(f"{dtab.iloc[ti].name}")
-                elif cols == 1:
-                    axs.plot(lags, cch)
-                    axs.set_title(f"{dtab.iloc[ti].name}")
-                else:
-                    axs[ti%cols].plot(lags, cch)
-                    axs[ti%cols].set_title(f"{dtab.iloc[ti].name}")
-        else:
-            cols = 1
-            rows = 1
-            fig, axs = plt.subplots(rows, cols, figsize=[cols*5, rows*5])
-            for cch in all_cchs:
-                if individual_overlay:
-                    axs.plot(lags, cch, alpha = 0.2)
-            if average_overlay:
-                axs.plot(lags, np.nanmean(all_cchs, axis=0), color='k', linewidth=1)
-            axs.set_title(f"n = {len(all_cchs)}")
-            axs.set_xlabel('Time Lag(ms)')
-            axs.set_ylabel('Correlation')
-            if show_cell_type:
-                plt.suptitle(f"Reference cell: {ref_cell.name}, {ref_cell['label_manual_text']}")
-            else:
-                plt.suptitle(f"Reference cell: {ref_cell.name}")
-            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-        
+def initialize_fonts():
+    from matplotlib import font_manager
+    font_dirs = ['/Volumes/Lab/Users/scooler/fonts']
+    font_files = font_manager.findSystemFonts(fontpaths=font_dirs)
+    for font_file in font_files:
+        font_manager.fontManager.addfont(font_file)
+
+    plt.rcParams['font.family'] = 'Arial'

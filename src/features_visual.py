@@ -1672,7 +1672,14 @@ class Feature_rf_convex_hull(Feature):
             map_index = cdl.channelize(ct.find_primary_channel(dtab.loc[[ci]]))
             rf_map = input_map[...,map_index].copy()
             threshold = dtab.at[ci, 'rf_threshold'].a[map_index]*1.1
-            rf_bool = convex_hull_image(np.squeeze(rf_map >= threshold))
+            try:
+                rf_bool = convex_hull_image(np.squeeze(rf_map >= threshold))
+            except:
+                bad_units.append(ci)
+                dtab.at[ci, 'rf_convex_hull'] = file_handling.wrapper(None)
+                dtab.at[ci, 'hull_center_x'] = None
+                dtab.at[ci, 'hull_center_y'] = None
+                continue
             rf_map[np.logical_not(rf_bool)] = 0
             fill_fraction = np.count_nonzero(rf_bool) / (rf_map.shape[0] * rf_map.shape[1])
             if np.any(rf_bool) and (fill_fraction < 0.2):

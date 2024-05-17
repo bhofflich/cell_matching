@@ -232,7 +232,9 @@ class Feature_rf_overlaps(Feature):
         primary_channels = {}
         for ctype in dtab['label_manual_text'].unique():
             
-            ctype_units = dtab.query('label_manual_text == @ctype and sta_extremes == sta_extremes and valid == True')
+            ctype_units = dtab.query('label_manual_text == @ctype and valid == True')
+            if len(ctype_units) == 0:
+                continue
             primary_channels[ctype] = cdl.channelize(ct.find_primary_channel(ctype_units))
         
         all_radii = ct.dataset_table.at[di, 'rf_radii'].a
@@ -305,7 +307,8 @@ class Feature_cross_correlations_complete_fast(Feature):
         
         # make much faster CCH
 
-        delays_half = np.around(np.arange(0, .101, .001), 3) * pq.s
+        # delays_half = np.around(np.arange(0, .101, .001), 3) * pq.s
+        delays_half = np.hstack((np.around(np.arange(0, .01, .0005), 4), np.around(np.arange(.01, .101, .001), 3))) * pq.s
         # delays = np.around(np.logspace(-3, -.5, 15), 4)
         # delays = np.concatenate([[0],delays]) * pq.s
         # delays_half = [0, .002, .003, .004] * pq.s
